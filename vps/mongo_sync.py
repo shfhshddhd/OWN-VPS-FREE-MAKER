@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from pymongo import MongoClient
+import gridfs
+
+DEFAULT_PATHS = [
+    "/opt/vps-data",
+    "/root/.pm2",
+    "/root/.ssh/authorized_keys",
+    "/etc/ssh/sshd_config.d/99-own-vps.conf",
+]
+
+EXCLUDE_DIRS = {"/proc", "/sys", "/dev", "/run", "/tmp", "/var/lib/apt/lists"}
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+def safe_files(roots):
+    seen = set()
+    for root in roots:
+        p = Path(root)
+        if not p.exists():
+            continue
+        if p.is_file():
+            yield str(p)
+            continue
+        for base, dirs, files in os.walk(p, followlinks=False):
+            base_abs = os.path.abspath(base)
+            dirs[:] = [
+                d for d in dirs
+                if os.path.abspath(os.path.join(base_abs, d)) not in EXCLUDE_DIRS
+            ]
+            for name in files:
+                path = os.path.abspath(os.path.join(base_abs, name))
+                try:
+                    st = os.lstat(path)
+                    if stat.S_ISREG(st.st_mode):
+                        if path not in seen:
+                            seen.add(path)
+                            yield path
+                except OSError:
+                    continue
+
+def package_manifest():
+    try:
+        out = subprocess.check_output(
+            ["dpkg-query", "-W", "-f=${Package}\t${Version}\n"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+        return out
+    except Exception:
+        return ""
+
+def connect(uri, db_name):
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000, retryWrites=True)
+    client.admin.command("ping")
+    db = client[db_name]
+    return client, db, gridfs.GridFS(db, collection="vps_files")
+
+def upload_if_changed(fs, files, path, runner_id, generation):
+    try:
+        before = os.stat(path)
+        digest = sha256_file(path)
+        after = os.stat(path)
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            return False
+        old = files.find_one({"path": path, "deleted": False})
+        if old and old.get("sha256") == digest:
+            return True
+        existing = fs.find_one({"sha256": digest})
+        if existing is None:
+            with open(path, "rb") as f:
+                fid = fs.put(
+                    f,
+                    filename=os.path.basename(path),
+                    sha256=digest,
+                    source_path=path,
+                    runner_id=runner_id,
+                    generation=generation,
+                )
+        else:
+            fid = existing._id
+        files.update_one(
+            {"path": path},
+            {"$set": {
+                "path": path,
+                "sha256": digest,
+                "size": after.st_size,
+                "mtime_ns": after.st_mtime_ns,
+                "file_id": fid,
+                "deleted": False,
+                "runner_id": runner_id,
+                "generation": generation,
+                "updated_at": time.time(),
+            }},
+            upsert=True,
+        )
+        return True
+    except (OSError, IOError):
+        return False
+
+def sync_once(db, fs, roots, runner_id, generation):
+    files = db.vps_files
+    current = set()
+    uploaded = 0
+    for path in safe_files(roots):
+        current.add(path)
+        if upload_if_changed(fs, files, path, runner_id, generation):
+            uploaded += 1
+
+    # Mark files deleted when they disappear from the managed roots.
+    prefixes = tuple(os.path.abspath(x).rstrip("/") + "/" for x in roots if Path(x).is_dir())
+    singles = {os.path.abspath(x) for x in roots if Path(x).is_file()}
+    for doc in files.find({"deleted": False}, {"path": 1}):
+        path = doc["path"]
+        managed = path in singles or path.startswith(prefixes)
+        if managed and path not in current and not os.path.exists(path):
+            files.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {
+                    "deleted": True,
+                    "updated_at": time.time(),
+                    "runner_id": runner_id,
+                    "generation": generation,
+                }},
+            )
+
+    db.vps_meta.update_one(
+        {"_id": "live"},
+        {"$set": {
+            "runner_id": runner_id,
+            "generation": generation,
+            "last_sync": time.time(),
+            "file_count": len(current),
+            "package_manifest": package_manifest(),
+            "status": "syncing",
+        }},
+        upsert=True,
+    )
+    return uploaded, len(current)
+
+def restore(db, fs, roots):
+    files = db.vps_files
+    restored = 0
+    for doc in files.find({"deleted": False}):
+        path = doc["path"]
+        managed = any(
+            path == os.path.abspath(x) or
+            (Path(x).is_dir() and path.startswith(os.path.abspath(x).rstrip("/") + "/"))
+            for x in roots
+        )
+        if not managed:
+            continue
+        fid = doc.get("file_id")
+        if not fid:
+            continue
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".restore-tmp")
+        with open(tmp, "wb") as out:
+            out.write(fs.get(fid).read())
+        os.replace(tmp, target)
+        try:
+            os.chmod(target, doc.get("mode", os.stat(target).st_mode) & 0o7777)
+        except OSError:
+            pass
+        restored += 1
+    return restored
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["sync", "restore"])
+    ap.add_argument("--uri", required=True)
+    ap.add_argument("--db", default="own_vps")
+    ap.add_argument("--runner-id", default=os.getenv("GITHUB_RUN_ID", "unknown"))
+    ap.add_argument("--generation", default=os.getenv("VPS_GENERATION", "0"))
+    ap.add_argument("--interval", type=int, default=15)
+    ap.add_argument("--path", action="append", dest="paths")
+    args = ap.parse_args()
+    roots = args.paths or DEFAULT_PATHS
+
+    client, db, fs = connect(args.uri, args.db)
+    try:
+        if args.mode == "restore":
+            n = restore(db, fs, roots)
+            db.vps_meta.update_one(
+                {"_id": "live"},
+                {"$set": {
+                    "restored_by": args.runner_id,
+                    "restored_at": time.time(),
+                    "status": "restored",
+                }},
+                upsert=True,
+            )
+            print(f"RESTORED_FILES={n}", flush=True)
+            return 0
+
+        while True:
+            n, total = sync_once(db, fs, roots, args.runner_id, args.generation)
+            print(f"SYNC files={total} changed_or_checked={n}", flush=True)
+            time.sleep(args.interval)
+    finally:
+        client.close()
+
+if __name__ == "__main__":
+    sys.exit(main())
