@@ -46,39 +46,23 @@ jobs:
           sudo systemctl enable ssh
           sudo systemctl start ssh
 
-      - name: Install Tailscale
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo systemctl enable --now tailscaled
-
-      - name: Check required secrets
+      - name: Check relay prerequisites
         shell: bash
         env:
-          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          RELAY_HOST: ${{ secrets.RELAY_HOST }}
+          RELAY_USER: ${{ secrets.RELAY_USER }}
+          RELAY_TUNNEL_PRIVATE_KEY: ${{ secrets.RELAY_TUNNEL_PRIVATE_KEY }}
+          RELAY_CONTROL_PRIVATE_KEY: ${{ secrets.RELAY_CONTROL_PRIVATE_KEY }}
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
           SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
         run: |
           set -euo pipefail
-          test -n "$TS_KEY" || { echo "Missing secret: TAILSCALE_AUTHKEY"; exit 1; }
+          test -n "$RELAY_HOST" || { echo "Missing secret: RELAY_HOST"; exit 1; }
+          test -n "$RELAY_USER" || { echo "Missing secret: RELAY_USER"; exit 1; }
+          test -n "$RELAY_TUNNEL_PRIVATE_KEY" || { echo "Missing secret: RELAY_TUNNEL_PRIVATE_KEY"; exit 1; }
+          test -n "$RELAY_CONTROL_PRIVATE_KEY" || { echo "Missing secret: RELAY_CONTROL_PRIVATE_KEY"; exit 1; }
           test -n "$STATE_KEY" || { echo "Missing secret: VPS_STATE_KEY"; exit 1; }
           test -n "$SSH_KEYS" || { echo "Missing secret: SSH_AUTHORIZED_KEYS"; exit 1; }
-
-      - name: Join Tailscale
-        shell: bash
-        env:
-          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          set -euo pipefail
-          if [ "${{ inputs.mode }}" = "initial" ]; then
-            sudo hostnamectl set-hostname own-vps
-            sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps"
-          else
-            sudo hostnamectl set-hostname "own-vps-staging-${{ github.run_id }}"
-            sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps-staging-${{ github.run_id }}"
-          fi
-          echo "TEMP_TAILSCALE_IP=$(sudo tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
 
       - name: Configure hardened SSH
         shell: bash
@@ -106,15 +90,12 @@ jobs:
           sudo sshd -t
           sudo systemctl restart ssh
 
-      - name: Enable stable public SSH endpoint
-        if: ${{ inputs.mode == 'initial' }}
+      - name: Stable endpoint placeholder
         shell: bash
         run: |
           set -euo pipefail
-          sudo tailscale funnel --yes --tcp=10000 tcp://127.0.0.1:22 --bg
-          sleep 3
-          sudo tailscale funnel status
-          echo "STABLE SSH ENDPOINT: own-vps.<your-tailnet>.ts.net:10000"
+          echo "Fixed endpoint is provided by the external SSH relay."
+          echo "The runner itself is not the public endpoint."
 
       - name: Download previous encrypted state
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -153,9 +134,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo systemctl is-active --quiet ssh
-          sudo systemctl is-active --quiet tailscaled
           test -d "$VPS_ROOT"
-          echo "WORKER READY FOR HANDOVER"
+          echo "WORKER READY FOR RELAY HANDOVER"
           printf 'ready run=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/ready.txt
 
       - name: Publish worker READY signal
@@ -194,42 +174,12 @@ jobs:
           echo "Release signal not received"
           exit 1
 
-      - name: Take over persistent Tailscale identity
-        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+      - name: Relay handover stage
         shell: bash
         run: |
           set -euo pipefail
-          sudo tailscale logout || true
-          sudo systemctl stop tailscaled || true
-          sudo rm -rf /var/lib/tailscale
-          sudo mkdir -p /var/lib/tailscale
-
-          # The encrypted snapshot stores the persistent Tailscale node
-          # state as /opt/vps-data/tailscale-state.tar. Restore that nested
-          # archive only after the old worker has released the node.
-          sudo tar -xpf /tmp/restore.tar.done -C / \
-            opt/vps-data/tailscale-state.tar \
-            etc/ssh/ssh_host_* \
-            2>/dev/null || true
-          if [ -f /opt/vps-data/tailscale-state.tar ]; then
-            sudo tar -xpf /opt/vps-data/tailscale-state.tar -C /
-          else
-            echo "Persistent Tailscale state archive missing"
-            exit 1
-          fi
-
-          sudo systemctl start tailscaled
-          sleep 8
-          sudo hostnamectl set-hostname own-vps
-          sudo systemctl restart ssh
-
-          sudo tailscale funnel --yes --tcp=10000 tcp://127.0.0.1:22 --bg
-          sleep 3
-
-          echo "PERSISTENT TAILSCALE IDENTITY RESTORED"
-          echo "STABLE SSH ENDPOINT: own-vps.<your-tailnet>.ts.net:10000"
-          sudo tailscale ip -4 | head -n1
-          sudo tailscale funnel status
+          echo "External relay performs the fixed-endpoint handover."
+          echo "No mesh VPN identity is used."
 
       - name: Restore PM2
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -252,10 +202,6 @@ jobs:
           if command -v pm2 >/dev/null 2>&1; then
             sudo pm2 save || true
           fi
-
-          # This archive is later restored only after the old worker releases
-          # the persistent identity.
-          sudo tar -cpf /opt/vps-data/tailscale-state.tar /var/lib/tailscale 2>/dev/null || true
 
           sudo tar -cpf /tmp/vps-state.tar             /opt/vps-data             /root/.pm2             /root/.ssh/authorized_keys             /etc/ssh/ssh_host_*             2>/dev/null || true
 
@@ -300,18 +246,13 @@ jobs:
           echo "Replacement worker did not report READY"
           exit 1
 
-      - name: Release persistent identity to replacement
+      - name: Release old worker
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sudo pm2 save 2>/dev/null || true
-          sudo tailscale logout || true
-          sudo systemctl stop tailscaled || true
+          echo "Old worker release stage completed."
           printf 'release source=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/release.txt
-          echo "HANDOVER RELEASED"
-          
+
       - name: Publish RELEASE signal
         uses: actions/upload-artifact@v4
         with:
