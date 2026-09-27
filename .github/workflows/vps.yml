@@ -152,7 +152,6 @@ jobs:
           compression-level: 0
 
       - name: Wait until the current worker is ready to rotate
-        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -268,6 +267,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          sudo pm2 save 2>/dev/null || true
+          sudo tailscale logout || true
+          sudo systemctl stop tailscaled || true
           printf 'release source=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/release.txt
           echo "HANDOVER RELEASED"
           
