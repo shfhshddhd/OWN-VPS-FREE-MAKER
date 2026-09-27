@@ -1,6 +1,6 @@
 # OWN VPS FREE MAKER
 
-Tailscale-free rolling SSH VPS architecture using GitHub Actions workers and one persistent SSH relay.
+Rolling SSH VPS architecture using GitHub-hosted workers and an independent fixed TCP relay.
 
 ## Architecture
 
@@ -8,62 +8,54 @@ Tailscale-free rolling SSH VPS architecture using GitHub Actions workers and one
 Termius
    |
    v
-Fixed relay host:2222
+FIXED RELAY_HOST:2222
    |
    v
 HAProxy TCP
    |
-   +--> current reverse SSH tunnel
-             |
-             v
-       current GitHub runner
-       A -> B -> C -> D...
+   v
+current reverse SSH tunnel
+   |
+   v
+GitHub runner A -> B -> C -> D...
 ```
 
-GitHub-hosted runners are disposable. The runner public IP is therefore never used as the client endpoint.
+The GitHub runner is temporary. The relay is the stable public endpoint.
 
-The persistent relay keeps the same Termius Host + Port while the active backend changes.
+## Important
 
-## Current workflow
+A GitHub Secret cannot reserve an arbitrary public IP. The Internet must have an actual machine/service that owns the public endpoint. This project uses that independent relay for exactly that reason.
 
-`.github/workflows/vps.yml`
+A literal live migration of RAM, open TCP sockets, or an existing SSH session between GitHub VMs is not possible. The project instead performs rolling replacement: the new worker becomes ready, the relay switches new connections, and the old worker drains.
 
-The worker:
+## Workflow
 
-1. boots a fresh Ubuntu runner
-2. restores encrypted application state when this is a handover
-3. creates an outbound reverse SSH tunnel to the relay
-4. verifies the worker SSH service
-5. activates its tunnel on the relay
-6. publishes a READY artifact for the previous worker
-7. snapshots persistent files with AES-256 GPG encryption
-8. dispatches the next worker
-9. waits for the next worker to become READY
-10. finishes the old worker
+`.github/workflows/vps.yml`:
 
-The workflow uses `workflow_dispatch` chaining. GitHub documents that `workflow_dispatch` events can create workflow runs when initiated with `GITHUB_TOKEN`, subject to repository permissions. 
+1. Boot a fresh Ubuntu runner
+2. Restore encrypted application state
+3. Start SSH
+4. Open an outbound reverse SSH tunnel to the relay
+5. Activate the worker on the fixed relay
+6. Publish READY
+7. Snapshot persistent state with AES-256 GPG encryption
+8. Dispatch the next worker
+9. Wait for the next worker READY
+10. Drain the old worker
 
-## Relay
+## Multi-user SSH
 
-See:
+Set `SSH_AUTHORIZED_KEYS` to multiple public keys, one per line.
 
-- `relay/setup-relay.sh`
-- `relay/README.md`
+Each person keeps their own private key. Everyone can use the same Termius Host + Port while the server authenticates each person with their separate key.
 
-The relay is an independent Linux VM. HAProxy runs in TCP mode and forwards SSH connections to the active loopback reverse tunnel.
+## Relay setup
 
-Public endpoint:
+See `relay/setup-relay.sh` and `relay/README.md`.
 
-`RELAY_HOST:2222`
+The relay must be a real persistent Linux host with a public endpoint. No random IP in GitHub Secrets can replace it.
 
-Termius should use:
-
-- Host: your relay DNS name or fixed IP
-- Port: `2222`
-- Username: `root` on the GitHub worker
-- Authentication: your normal SSH private key
-
-## Required GitHub Actions secrets
+## Secrets
 
 ```
 RELAY_HOST
@@ -74,25 +66,4 @@ VPS_STATE_KEY
 SSH_AUTHORIZED_KEYS
 ```
 
-Never commit private keys or `VPS_STATE_KEY` to the repository.
-
-## State limitations
-
-This is rolling replacement, not live VM migration.
-
-Files included in the snapshot are:
-
-- `/opt/vps-data`
-- `/root/.pm2`
-- `/root/.ssh/authorized_keys`
-- SSH host keys are captured for archival but deliberately not restored onto a new worker
-
-RAM, open processes, open TCP sockets, and existing SSH sessions cannot be migrated between GitHub-hosted VMs. A client may therefore need to reconnect during a worker rotation.
-
-For applications that write important data elsewhere, add those paths to the encrypted snapshot before relying on them across handovers.
-
-## Free relay option
-
-Oracle Cloud documents Always Free compute resources, including free VM resources in the tenancy's home region. Capacity can vary by region, so availability is not guaranteed at instance creation time.
-
-No Tailscale is used by this project.
+Never commit private keys or encryption secrets.
