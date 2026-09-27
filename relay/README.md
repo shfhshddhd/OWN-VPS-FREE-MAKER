@@ -1,39 +1,77 @@
 # Fixed SSH Relay
 
-This relay is the permanent public endpoint for the rolling GitHub worker.
+This is the independent public TCP/SSH relay for the rolling GitHub-hosted worker.
 
-Architecture:
+```
+Termius
+   |
+   v
+RELAY_HOST:2222
+   |
+   v
+HAProxy TCP
+   |
+   v
+127.0.0.1:<active tunnel>
+   |
+   v
+current GitHub runner:22
+```
 
-Termius -> relay-host:2222 -> HAProxy -> 127.0.0.1:<active tunnel> -> current GitHub runner:22
+## Why a relay is required
 
-GitHub runners create outbound reverse SSH tunnels, so the runner's changing public IP never becomes the client endpoint.
+A GitHub-hosted runner gets a temporary public network identity. A GitHub Secret cannot create or reserve an arbitrary public IP. The relay is therefore the stable public endpoint while workers rotate.
 
 ## Setup
 
-Use a persistent Linux VM. Oracle Cloud documents Always Free compute resources, including VM instances, but availability can vary by region.
+Use any persistent Linux host that you control and that provides a real public IPv4/IPv6 address.
 
 1. Run `relay/setup-relay.sh` as root.
-2. Generate two SSH key pairs:
-   - tunnel key: used only by GitHub runners
-   - control key: used only to activate a backend
-3. Put the tunnel public key into:
-   `/home/relay-tunnel/.ssh/authorized_keys`
-4. Put the control public key into the restricted `relay-control` authorized_keys line.
-5. Replace `PLACEHOLDER_CONTROL_PUBLIC_KEY` in the setup script before running it, or edit the authorized_keys file directly.
-6. Allow inbound TCP/2222 in the VM firewall/security list.
-7. Keep TCP/22 available for your own relay administration.
-8. In GitHub Actions secrets set:
-   - RELAY_HOST = relay DNS name or fixed public IP
-   - RELAY_USER = relay-tunnel
-   - RELAY_TUNNEL_PRIVATE_KEY = tunnel private key
-   - RELAY_CONTROL_PRIVATE_KEY = control private key
-   - VPS_STATE_KEY = random encryption passphrase
-   - SSH_AUTHORIZED_KEYS = your normal SSH public key(s)
+2. Generate a tunnel key pair and a separate control key pair.
+3. Put the tunnel public key in `relay-tunnel` authorized_keys.
+4. Put the control public key in the restricted `relay-control` authorized_keys entry.
+5. Allow inbound TCP/2222.
+6. Keep TCP/22 available only for relay administration.
+7. Configure the GitHub secrets listed below.
 
-## Important
+### GitHub secrets
 
-The relay does not migrate existing SSH/TCP sessions. HAProxy switches new connections to the new worker. Existing connections can still drop when GitHub destroys the old VM.
+```
+RELAY_HOST
+RELAY_USER
+RELAY_TUNNEL_PRIVATE_KEY
+RELAY_CONTROL_PRIVATE_KEY
+VPS_STATE_KEY
+SSH_AUTHORIZED_KEYS
+```
 
-The state snapshot protects files and PM2 state, but it is not a live RAM migration. Applications that write outside /opt/vps-data or /root/.pm2 need their data added to the snapshot.
+`SSH_AUTHORIZED_KEYS` can contain multiple public keys, one per line. This is how you can give yourself and a friend separate SSH keys while both use the same Termius Host + Port.
 
-Do not put any private key into this repository.
+## Termius
+
+Use:
+
+- Host: relay public DNS name or fixed IP
+- Port: `2222`
+- Username: `root`
+- Identity: your own SSH private key
+
+A friend uses the same Host, Port and username, but their own private key. Their public key must be present in `SSH_AUTHORIZED_KEYS`.
+
+## Handover behavior
+
+The workflow starts the replacement runner before releasing the old worker. The relay switches new TCP connections to the replacement.
+
+Existing SSH/TCP sessions are not live-migrated. A session already attached to the old GitHub VM can drop during rotation and must reconnect.
+
+Files/RAM are also different:
+
+- `/opt/vps-data` and PM2 state are snapshotted
+- RAM, running processes and open TCP sockets cannot be migrated
+- SSH host keys are not restored onto the replacement
+
+## Security
+
+Never commit private keys or `VPS_STATE_KEY`.
+
+The tunnel key is restricted to remote forwarding. The control key is restricted to the activation command.
