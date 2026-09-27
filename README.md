@@ -1,100 +1,117 @@
 # OWN-VPS-FREE-MAKER
 
-This repository builds an experimental rolling VPS-style worker on GitHub-hosted Ubuntu runners.
+A rolling VPS-style environment built on GitHub-hosted Ubuntu runners.
 
-## Current architecture
+## Architecture
 
-GitHub-hosted runners are temporary VMs. GitHub documents that public repositories currently receive standard Ubuntu runners with 4 CPU and 16 GB RAM, and that each job runs on a fresh VM. GitHub-hosted jobs have a 6-hour execution limit.
+```
+Termius
+   |
+   | fixed host + port
+   v
+Tailscale Funnel
+   |
+   v
+Current GitHub runner
+   |
+   +--> A -> B -> C -> D -> ...
+```
 
-This project therefore treats every runner as a disposable worker:
+The runner is disposable. The public SSH endpoint is not tied to the runner's temporary public IP.
 
-A → B → C → D → ...
+GitHub documents that standard Linux runners in public repositories are fresh VMs with 4 CPU, 16 GB RAM and 14 GB SSD. GitHub-hosted jobs have a maximum execution time of 360 minutes, so this project performs a controlled handover before the limit. citeturn0search0turn1search0
 
-Before the current worker reaches the limit, it:
+## Stable SSH endpoint
 
-1. Saves an encrypted VPS snapshot
-2. Uploads the snapshot as a protected-by-encryption artifact
-3. Dispatches the next workflow using `workflow_dispatch`
-4. The next worker restores the application/filesystem state
-5. The next worker reports READY
-6. The old worker publishes a RELEASE signal
-7. The replacement may then restore the persistent network identity and take over
+The workflow uses Tailscale Funnel as the public TCP entry point.
 
-GitHub confirms that `workflow_dispatch` can be triggered from a workflow using `GITHUB_TOKEN`, and that this exception creates a new workflow run.
+SSH is forwarded through Funnel from:
 
-## Network
+```
+own-vps.<your-tailnet>.ts.net:10000
+```
 
-The management network uses Tailscale.
+Port 10000 is used because Tailscale Funnel supports raw TCP forwarding on 443, 8443 and 10000. Funnel provides a predictable DNS name for a device, so the hostname can be shared once and reused when the Funnel is turned back on. citeturn4search0turn2search0
 
-Tailscale assigns a stable IP to a registered node. The IP remains stable while that node remains registered; losing the node state causes a new identity/IP.
+Termius does not need Tailscale installed for the public Funnel endpoint.
 
-The workflow deliberately does **not** clone the Tailscale node state while the old worker is still active. Tailscale documents that cloning node state can create duplicate node identities/IPs.
+## Handover sequence
 
-The intended handover is:
+1. Worker A starts and exposes the stable SSH Funnel.
+2. A saves an encrypted application snapshot.
+3. A starts Worker B.
+4. B joins Tailscale using a temporary staging identity.
+5. B restores application/filesystem state without cloning the live Tailscale identity.
+6. B reports READY.
+7. A releases the persistent Tailscale identity.
+8. B restores the persistent Tailscale node state.
+9. B enables the same Funnel endpoint.
+10. B restores PM2 state and becomes the active worker.
+11. B later repeats the same process for C.
 
-OLD ACTIVE
-→ NEW PREPARED
-→ NEW READY
-→ OLD RELEASE
-→ NEW RESTORES PERSISTENT IDENTITY
-→ NEW ACTIVE
+The persistent Tailscale state is never cloned while A is still active. This avoids duplicate node identity problems.
 
 ## Required secrets
 
-Add these repository Actions secrets:
+Create these repository Actions secrets:
 
 ### TAILSCALE_AUTHKEY
 
-A Tailscale auth key that allows the temporary worker to join your tailnet.
+Tailscale auth key used by workers to join the tailnet.
 
 ### VPS_STATE_KEY
 
-A long random passphrase used to encrypt the VPS snapshot.
-
-Because the repository is public, never upload the snapshot unencrypted.
+A long random passphrase used to encrypt the worker snapshot with AES-256.
 
 ### SSH_AUTHORIZED_KEYS
 
-One or more SSH public keys, one per line.
+SSH public key or multiple public keys, one per line.
 
-Never put private SSH keys in this secret or in the repository.
+Never put a private SSH key in the repository or in this secret.
 
-## First run
+## Tailscale Funnel prerequisite
 
-1. Add all three secrets
-2. Open Actions
-3. Select **OWN VPS - Rolling 24/7 Worker**
-4. Choose **initial**
-5. Run it
-6. The logs will show the temporary Tailscale IP
-7. Connect from Termius using SSH on port 22 and the private key corresponding to your authorized public key
+Funnel must be enabled for the tailnet before the workflow can expose the public SSH endpoint. Tailscale requires Funnel to be permitted by the tailnet policy. citeturn4search1
 
-For your friend, use a separate SSH public key and authorize that key as well. The friend also needs access to the same Tailscale network.
+After the first successful run, the workflow prints the Funnel endpoint in the Actions log.
 
-## Persistent VPS data
+## Termius
 
-For applications that must survive worker replacement, use:
+Use:
 
-`/opt/vps-data`
+```
+Host: own-vps.<your-tailnet>.ts.net
+Port: 10000
+Username: root
+Authentication: SSH private key
+```
 
-The workflow persists:
+Use separate SSH keys for different people when possible.
 
-- /opt/vps-data
+## Persistent state
+
+The workflow currently persists:
+
+- `/opt/vps-data`
 - PM2 state
-- root authorized SSH keys
+- SSH authorized keys
 - SSH host keys
-- Tailscale node state
+- persistent Tailscale node state
 
-The snapshot is encrypted with `VPS_STATE_KEY` before it is uploaded.
+The snapshot is encrypted before upload.
 
-GitHub artifacts are designed to persist files between workflow runs and can be downloaded by a later run with the appropriate token/run ID.
+GitHub Actions artifacts can be passed between workflow runs when the appropriate token and source run ID are supplied. citeturn3search6
 
-## Important limitation
+## Important limitations
 
-This is **not literal VM live migration**.
+This is rolling worker replacement, not literal VM live migration.
 
-A GitHub-hosted runner cannot have its live RAM, kernel state, open TCP sockets, or arbitrary process memory transferred to another GitHub VM.
+GitHub does not transfer live RAM, kernel state or open TCP sockets from A to B. An existing SSH session can therefore require reconnecting during a handover.
 
-The design provides rolling worker replacement and persistent filesystem/application state. Applications such as Telegram bots may still need to reconnect after the worker handover.
+Applications that persist their important state to `/opt/vps-data` or have a reliable restart mechanism are the intended workload.
 
-A true permanent production VPS should use a persistent VM/cloud server or a self-hosted runner. GitHub-hosted runners are intentionally disposable.
+GitHub-hosted runners are disposable infrastructure. This project is designed as a free experimental VPS-style environment, not as a replacement for a permanent production VM.
+
+## Current workflow
+
+` .github/workflows/vps.yml `
