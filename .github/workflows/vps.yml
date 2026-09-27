@@ -31,7 +31,7 @@ jobs:
     env:
       VPS_ROOT: /opt/vps-data
       STATE_FILE: /tmp/vps-state.tar.gpg
-      HANDOVER_AT: 31800
+      HANDOVER_AT: 10800
       REPO: ${{ github.repository }}
 
     steps:
@@ -65,13 +65,19 @@ jobs:
           test -n "$STATE_KEY" || { echo "Missing secret: VPS_STATE_KEY"; exit 1; }
           test -n "$SSH_KEYS" || { echo "Missing secret: SSH_AUTHORIZED_KEYS"; exit 1; }
 
-      - name: Join temporary management network
+      - name: Join Tailscale
         shell: bash
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -euo pipefail
-          sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps-worker-${{ github.run_id }}"
+          if [ "${{ inputs.mode }}" = "initial" ]; then
+            sudo hostnamectl set-hostname own-vps
+            sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps"
+          else
+            sudo hostnamectl set-hostname "own-vps-staging-${{ github.run_id }}"
+            sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps-staging-${{ github.run_id }}"
+          fi
           echo "TEMP_TAILSCALE_IP=$(sudo tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
 
       - name: Configure hardened SSH
@@ -99,6 +105,16 @@ jobs:
           EOF
           sudo sshd -t
           sudo systemctl restart ssh
+
+      - name: Enable stable public SSH endpoint
+        if: ${{ inputs.mode == 'initial' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tailscale funnel --yes --tcp=10000 tcp://127.0.0.1:22 --bg
+          sleep 3
+          sudo tailscale funnel status
+          echo "STABLE SSH ENDPOINT: own-vps.<your-tailnet>.ts.net:10000"
 
       - name: Download previous encrypted state
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -152,6 +168,7 @@ jobs:
           compression-level: 0
 
       - name: Wait until the current worker is ready to rotate
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -189,8 +206,16 @@ jobs:
           sudo tar -xpf /tmp/restore.tar.done -C / var/lib/tailscale etc/ssh/ssh_host_*
           sudo systemctl start tailscaled
           sleep 8
+          sudo hostnamectl set-hostname own-vps
           sudo systemctl restart ssh
-          echo "PERSISTENT TAILSCALE IP: $(sudo tailscale ip -4 | head -n1)"
+
+          sudo tailscale funnel --yes --tcp=10000 tcp://127.0.0.1:22 --bg
+          sleep 3
+
+          echo "PERSISTENT TAILSCALE IDENTITY RESTORED"
+          echo "STABLE SSH ENDPOINT: own-vps.<your-tailnet>.ts.net:10000"
+          sudo tailscale ip -4 | head -n1
+          sudo tailscale funnel status
 
       - name: Restore PM2
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
