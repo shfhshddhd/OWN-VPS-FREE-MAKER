@@ -26,7 +26,7 @@ jobs:
   vps:
     name: VPS Worker
     runs-on: ubuntu-24.04
-    timeout-minutes: 355
+    timeout-minutes: 350
 
     env:
       VPS_ROOT: /opt/vps-data
@@ -45,7 +45,6 @@ jobs:
           sudo chmod 755 "$VPS_ROOT"
           sudo systemctl enable ssh
           sudo systemctl start ssh
-          echo "Base VPS environment ready"
 
       - name: Install Tailscale
         shell: bash
@@ -53,7 +52,6 @@ jobs:
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable --now tailscaled
-          echo "Tailscale installed"
 
       - name: Check required secrets
         shell: bash
@@ -74,8 +72,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps-worker-${{ github.run_id }}"
-          sudo tailscale ip -4 | tee /tmp/temp-ts-ip
-          echo "Temporary worker Tailscale IP: $(cat /tmp/temp-ts-ip)"
+          echo "TEMP_TAILSCALE_IP=$(sudo tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
 
       - name: Configure hardened SSH
         shell: bash
@@ -95,17 +92,15 @@ jobs:
           KbdInteractiveAuthentication no
           PubkeyAuthentication yes
           ChallengeResponseAuthentication no
-          UsePAM yes
           X11Forwarding no
           AllowTcpForwarding yes
           ClientAliveInterval 60
           ClientAliveCountMax 3
           EOF
-
           sudo sshd -t
           sudo systemctl restart ssh
 
-      - name: Restore previous VPS snapshot
+      - name: Download previous encrypted state
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
         uses: actions/download-artifact@v4
         with:
@@ -115,61 +110,27 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
 
-      - name: Decrypt and restore previous state
+      - name: Restore application state without cloning live network identity
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
         shell: bash
         env:
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
         run: |
           set -euo pipefail
-          test -f "/tmp/previous-state/state.tar.gpg"
+          test -f /tmp/previous-state/vps-state.tar.gpg
           printf '%s' "$STATE_KEY" >/tmp/state-pass
           chmod 600 /tmp/state-pass
-          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --decrypt "/tmp/previous-state/state.tar.gpg" >/tmp/restore.tar
-          sudo tar -xpf /tmp/restore.tar -C /
-          rm -f /tmp/state-pass /tmp/restore.tar
-          echo "Persistent VPS state restored"
+          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --decrypt /tmp/previous-state/vps-state.tar.gpg >/tmp/restore.tar
 
-      - name: Reconnect persistent Tailscale identity after old worker is released
-        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
-        shell: bash
-        env:
-          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
-        run: |
-          set -euo pipefail
-          echo "Waiting for previous worker to release the persistent identity..."
-          for i in $(seq 1 90); do
-            if sudo test -f /opt/vps-data/.handover-release-${{ inputs.source_run_id }}; then
-              break
-            fi
-            sleep 10
-          done
-          if ! sudo test -f /opt/vps-data/.handover-release-${{ inputs.source_run_id }}; then
-            echo "Previous worker did not release identity in time"
-            exit 1
-          fi
+          # IMPORTANT: do not restore the old Tailscale state while the old
+          # worker is still online. Tailscale warns that cloning node state
+          # creates duplicate node identities/IPs.
+          sudo tar -xpf /tmp/restore.tar -C /             --exclude='var/lib/tailscale'             --exclude='opt/vps-data/tailscale-state.tar'             --exclude='etc/ssh/ssh_host_*'
 
-          sudo tailscale logout || true
-          sudo systemctl stop tailscaled || true
-          sudo rm -rf /var/lib/tailscale
-          sudo mkdir -p /var/lib/tailscale
-          sudo tar -xpf /opt/vps-data/tailscale-state.tar -C / 2>/dev/null || true
-          sudo systemctl start tailscaled
-          sleep 5
-          sudo tailscale status
-          sudo tailscale ip -4 | tee /tmp/active-ts-ip
-
-      - name: Restore PM2 and applications
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f /root/.pm2/dump.pm2 ]; then
-            if ! command -v pm2 >/dev/null 2>&1; then
-              sudo npm install -g pm2
-            fi
-            sudo pm2 resurrect || true
-          fi
-          echo "Application restoration complete"
+          sudo mkdir -p /opt/vps-data
+          sudo mv /tmp/restore.tar /tmp/restore.tar.done
+          rm -f /tmp/state-pass
+          echo "Application and filesystem state restored"
 
       - name: VPS readiness gate
         shell: bash
@@ -178,32 +139,41 @@ jobs:
           sudo systemctl is-active --quiet ssh
           sudo systemctl is-active --quiet tailscaled
           test -d "$VPS_ROOT"
-          if command -v pm2 >/dev/null 2>&1; then
-            sudo pm2 ping || true
-          fi
-          echo "VPS READY"
-          echo "Tailscale IP: $(sudo tailscale ip -4 | head -n1)"
+          echo "WORKER READY FOR HANDOVER"
+          printf 'ready run=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/ready.txt
 
-      - name: Publish READY signal
+      - name: Publish worker READY signal
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: handover-ready-${{ github.run_id }}
+          path: /tmp/ready.txt
+          retention-days: 1
+          compression-level: 0
+
+      - name: Wait until the current worker is ready to rotate
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         run: |
           set -euo pipefail
-          printf 'ready run=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)"             | tee /tmp/ready.txt
-          echo "New worker is READY"
+          start=$(date +%s)
+          target=$((start + HANDOVER_AT))
+          while [ "$(date +%s)" -lt "$target" ]; do
+            sleep 30
+          done
 
-      - name: Save persistent state before rotation
+      - name: Save encrypted persistent VPS snapshot
         shell: bash
         env:
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
         run: |
           set -euo pipefail
-          sudo mkdir -p "$VPS_ROOT"
           if command -v pm2 >/dev/null 2>&1; then
             sudo pm2 save || true
           fi
 
-          # Keep the persistent Tailscale identity inside the encrypted snapshot.
+          # This archive is later restored only after the old worker releases
+          # the persistent identity.
           sudo tar -cpf /opt/vps-data/tailscale-state.tar /var/lib/tailscale 2>/dev/null || true
 
           sudo tar -cpf /tmp/vps-state.tar             /opt/vps-data             /root/.pm2             /root/.ssh/authorized_keys             /etc/ssh/ssh_host_*             2>/dev/null || true
@@ -213,9 +183,8 @@ jobs:
           gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --symmetric --cipher-algo AES256             --output "$STATE_FILE" /tmp/vps-state.tar
           rm -f /tmp/state-pass /tmp/vps-state.tar
           sudo chmod 600 "$STATE_FILE"
-          echo "Encrypted persistent state snapshot created"
 
-      - name: Upload encrypted persistent state
+      - name: Upload encrypted state for the next worker
         uses: actions/upload-artifact@v4
         with:
           name: vps-state-${{ github.run_id }}
@@ -223,42 +192,55 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-      - name: Trigger next worker before this worker expires
-        if: ${{ inputs.mode != 'handover' || inputs.mode == 'handover' }}
+      - name: Start the next worker
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "Starting next worker from current run ${{ github.run_id }}"
           gh workflow run vps.yml             --repo "$REPO"             --ref main             -f mode=handover             -f source_run_id="${{ github.run_id }}"
-          echo "Next worker dispatch submitted"
+          echo "NEXT WORKER DISPATCHED"
 
-      - name: Wait for safe handover window
+      - name: Wait for next worker READY signal
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "Waiting for the replacement worker to become READY..."
-          sleep 120
-
-      - name: Release persistent identity and finish old worker
-        shell: bash
-        run: |
-          set -euo pipefail
-          touch "$VPS_ROOT/.handover-release-${{ github.run_id }}"
-          echo "HANDOVER RELEASED"
-          echo "The replacement worker may now take the persistent identity."
-          sleep 30
-
-      - name: Keep worker alive until planned expiry
-        shell: bash
-        run: |
-          set -euo pipefail
-          while true; do
-            elapsed=$(awk '{print int($1)}' /proc/uptime)
-            if [ "$elapsed" -ge "$HANDOVER_AT" ]; then
-              echo "Planned worker lifetime reached"
-              break
+          echo "Waiting for replacement worker..."
+          for i in $(seq 1 150); do
+            count=$(gh api               -H "Accept: application/vnd.github+json"               "/repos/$REPO/actions/artifacts?name=handover-ready-&per_page=100"               --jq '[.artifacts[] | select(.name | startswith("handover-ready-"))] | length' 2>/dev/null || echo 0)
+            if [ "$count" -gt 0 ]; then
+              echo "A replacement worker has reported READY"
+              exit 0
             fi
-            sleep 30
+            sleep 10
           done
+          echo "Replacement worker did not report READY"
+          exit 1
+
+      - name: Release persistent identity to replacement
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf 'release source=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/release.txt
+          echo "HANDOVER RELEASED"
+          
+      - name: Publish RELEASE signal
+        uses: actions/upload-artifact@v4
+        with:
+          name: handover-release-${{ github.run_id }}
+          path: /tmp/release.txt
+          retention-days: 1
+          compression-level: 0
+
+      - name: Finish old worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Old worker is now draining"
+          sudo pm2 save 2>/dev/null || true
+          sleep 30
+          echo "OLD WORKER STOPPING"
