@@ -203,7 +203,21 @@ jobs:
           sudo systemctl stop tailscaled || true
           sudo rm -rf /var/lib/tailscale
           sudo mkdir -p /var/lib/tailscale
-          sudo tar -xpf /tmp/restore.tar.done -C / var/lib/tailscale etc/ssh/ssh_host_*
+
+          # The encrypted snapshot stores the persistent Tailscale node
+          # state as /opt/vps-data/tailscale-state.tar. Restore that nested
+          # archive only after the old worker has released the node.
+          sudo tar -xpf /tmp/restore.tar.done -C / \
+            opt/vps-data/tailscale-state.tar \
+            etc/ssh/ssh_host_* \
+            2>/dev/null || true
+          if [ -f /opt/vps-data/tailscale-state.tar ]; then
+            sudo tar -xpf /opt/vps-data/tailscale-state.tar -C /
+          else
+            echo "Persistent Tailscale state archive missing"
+            exit 1
+          fi
+
           sudo systemctl start tailscaled
           sleep 8
           sudo hostnamectl set-hostname own-vps
