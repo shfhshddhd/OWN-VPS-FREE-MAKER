@@ -60,8 +60,14 @@ chmod 755 /usr/local/sbin/activate-vps-backend
 
 # Only the control key may run the activation command.
 # Paste the generated control public key after replacing PLACEHOLDER.
+cat >/home/relay-tunnel/.ssh/authorized_keys <<'EOF'
+restrict,permitlisten="127.0.0.1:*" ssh-ed25519 PLACEHOLDER_TUNNEL_PUBLIC_KEY
+EOF
+chown relay-tunnel:relay-tunnel /home/relay-tunnel/.ssh/authorized_keys
+chmod 600 /home/relay-tunnel/.ssh/authorized_keys
+
 cat >/home/relay-control/.ssh/authorized_keys <<'EOF'
-command="/usr/local/sbin/activate-vps-backend",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty ssh-ed25519 PLACEHOLDER_CONTROL_PUBLIC_KEY
+command="/usr/local/sbin/activate-vps-backend",no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 PLACEHOLDER_CONTROL_PUBLIC_KEY
 EOF
 chown relay-control:relay-control /home/relay-control/.ssh/authorized_keys
 chmod 600 /home/relay-control/.ssh/authorized_keys
@@ -83,5 +89,5 @@ systemctl restart haproxy
 systemctl restart ssh
 
 echo "Relay base installation complete."
-echo "Next: replace PLACEHOLDER_CONTROL_PUBLIC_KEY and add the tunnel public key to relay-tunnel authorized_keys."
+echo "Next: replace both public-key placeholders in /home/relay-tunnel/.ssh/authorized_keys and /home/relay-control/.ssh/authorized_keys."
 echo "Public Termius endpoint: <relay-host>:2222"
