@@ -30,6 +30,8 @@ jobs:
       STATE_FILE: /tmp/vps-state.tar.gpg
       HANDOVER_AT: 10800
       REPO: ${{ github.repository }}
+      SUPERDMZ_HOST: sareeffucker.dmzgate.com
+      SUPERDMZ_PORT: 16740
 
     steps:
       - name: Prepare base system
@@ -37,26 +39,45 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server curl jq git rsync gpg tar ca-certificates
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server curl jq git rsync gpg tar ca-certificates netcat-openbsd
           sudo mkdir -p "$VPS_ROOT"
           sudo chmod 755 "$VPS_ROOT"
           sudo systemctl enable --now ssh
 
-      - name: Check relay prerequisites
+      - name: Check SuperDMZ secret
         shell: bash
         env:
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-          RELAY_USER: ${{ secrets.RELAY_USER }}
-          RELAY_TUNNEL_PRIVATE_KEY: ${{ secrets.RELAY_TUNNEL_PRIVATE_KEY }}
-          RELAY_CONTROL_PRIVATE_KEY: ${{ secrets.RELAY_CONTROL_PRIVATE_KEY }}
-          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
-          SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+          SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
         run: |
           set -euo pipefail
-          for pair in             "RELAY_HOST:$RELAY_HOST"             "RELAY_USER:$RELAY_USER"             "RELAY_TUNNEL_PRIVATE_KEY:$RELAY_TUNNEL_PRIVATE_KEY"             "RELAY_CONTROL_PRIVATE_KEY:$RELAY_CONTROL_PRIVATE_KEY"             "VPS_STATE_KEY:$STATE_KEY"             "SSH_AUTHORIZED_KEYS:$SSH_KEYS"; do
-            name="${pair%%:*}"; value="${pair#*:}"
-            test -n "$value" || { echo "Missing secret: $name"; exit 1; }
+          test -n "$SUPERDMZ_TOKEN" || {
+            echo "Missing GitHub secret: SUPERDMZ_TOKEN"
+            exit 1
+          }
+
+      - name: Install and connect SuperDMZ
+        shell: bash
+        env:
+          SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL https://superdmz.com/download/LinuxInstaller.sh | sudo sh
+
+          sudo superdmz -add-token="$SUPERDMZ_TOKEN"
+
+          echo "Waiting for SuperDMZ tunnel..."
+          for i in $(seq 1 30); do
+            if sudo superdmz -status 2>&1 | grep -qiE 'online|connected|active'; then
+              break
+            fi
+            sleep 2
           done
+
+          echo "SuperDMZ status:"
+          sudo superdmz -status
+          echo "SuperDMZ tunnels:"
+          sudo superdmz -list
 
       - name: Configure hardened SSH
         shell: bash
@@ -64,9 +85,15 @@ jobs:
           SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
         run: |
           set -euo pipefail
+          test -n "$SSH_KEYS" || {
+            echo "Missing GitHub secret: SSH_AUTHORIZED_KEYS"
+            exit 1
+          }
+
           sudo install -d -m 700 /root/.ssh
           printf '%s\n' "$SSH_KEYS" | sudo tee /root/.ssh/authorized_keys >/dev/null
           sudo chmod 600 /root/.ssh/authorized_keys
+
           sudo install -d -m 755 /etc/ssh/sshd_config.d
           sudo tee /etc/ssh/sshd_config.d/99-own-vps.conf >/dev/null <<'EOF'
           PermitRootLogin prohibit-password
@@ -79,29 +106,9 @@ jobs:
           ClientAliveInterval 60
           ClientAliveCountMax 3
           EOF
+
           sudo sshd -t
           sudo systemctl restart ssh
-
-      - name: Establish reverse SSH tunnel to relay
-        shell: bash
-        env:
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-          RELAY_USER: ${{ secrets.RELAY_USER }}
-          RELAY_TUNNEL_PRIVATE_KEY: ${{ secrets.RELAY_TUNNEL_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          install -d -m 700 /tmp/relay-ssh
-          printf '%s\n' "$RELAY_TUNNEL_PRIVATE_KEY" >/tmp/relay-ssh/tunnel_key
-          chmod 600 /tmp/relay-ssh/tunnel_key
-          TUNNEL_PORT=$((20000 + (GITHUB_RUN_ID % 9000)))
-          echo "$TUNNEL_PORT" >/tmp/relay_port
-          ssh-keyscan -T 10 -H "$RELAY_HOST" >>/tmp/relay-ssh/known_hosts 2>/dev/null
-          chmod 600 /tmp/relay-ssh/known_hosts
-          nohup ssh -N             -o BatchMode=yes             -o ExitOnForwardFailure=yes             -o ServerAliveInterval=20             -o ServerAliveCountMax=3             -o StrictHostKeyChecking=yes             -o UserKnownHostsFile=/tmp/relay-ssh/known_hosts             -i /tmp/relay-ssh/tunnel_key             -R "127.0.0.1:$TUNNEL_PORT:127.0.0.1:22"             "$RELAY_USER@$RELAY_HOST" >/tmp/relay-tunnel.log 2>&1 &
-          echo $! >/tmp/relay-tunnel.pid
-          sleep 3
-          kill -0 "$(cat /tmp/relay-tunnel.pid)" 2>/dev/null || { cat /tmp/relay-tunnel.log; exit 1; }
-          echo "RELAY TUNNEL READY"
 
       - name: Download previous encrypted state
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -120,21 +127,21 @@ jobs:
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
         run: |
           set -euo pipefail
+          test -n "$STATE_KEY" || {
+            echo "Missing GitHub secret: VPS_STATE_KEY"
+            exit 1
+          }
+
           test -f /tmp/previous-state/vps-state.tar.gpg
           printf '%s' "$STATE_KEY" >/tmp/state-pass
           chmod 600 /tmp/state-pass
-          gpg --batch --yes --pinentry-mode loopback --passphrase-file /tmp/state-pass --decrypt /tmp/previous-state/vps-state.tar.gpg >/tmp/restore.tar
+
+          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --decrypt /tmp/previous-state/vps-state.tar.gpg >/tmp/restore.tar
+
           sudo tar -xpf /tmp/restore.tar -C / --exclude='etc/ssh/ssh_host_*'
+
           rm -f /tmp/state-pass /tmp/restore.tar
           echo "Application state restored"
-
-      - name: VPS readiness gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo systemctl is-active --quiet ssh
-          test -d "$VPS_ROOT"
-          printf 'ready run=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/ready.txt
 
       - name: Restore PM2
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -149,30 +156,27 @@ jobs:
             sudo pm2 resurrect || true
           fi
 
-      - name: Activate this worker on fixed relay
+      - name: VPS readiness gate
         shell: bash
-        env:
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-          RELAY_CONTROL_PRIVATE_KEY: ${{ secrets.RELAY_CONTROL_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          TUNNEL_PORT="$(cat /tmp/relay_port)"
-          install -d -m 700 /tmp/relay-control
-          printf '%s\n' "$RELAY_CONTROL_PRIVATE_KEY" >/tmp/relay-control/control_key
-          chmod 600 /tmp/relay-control/control_key
-          ssh-keyscan -T 10 -H "$RELAY_HOST" >>/tmp/relay-control/known_hosts 2>/dev/null
-          chmod 600 /tmp/relay-control/known_hosts
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/relay-control/known_hosts             -i /tmp/relay-control/control_key relay-control@"$RELAY_HOST" "activate $TUNNEL_PORT"
-          echo "FIXED RELAY NOW POINTS TO THIS WORKER"
+          sudo systemctl is-active --quiet ssh
+          test -d "$VPS_ROOT"
 
-      - name: Verify fixed relay TCP endpoint
-        shell: bash
-        env:
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-        run: |
-          set -euo pipefail
-          timeout 10 bash -c "cat </dev/null >/dev/tcp/$RELAY_HOST/2222"
-          echo "FIXED RELAY TCP ENDPOINT IS REACHABLE"
+          for i in $(seq 1 20); do
+            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then
+              echo "SUPERDMZ TCP ENDPOINT REACHABLE: $SUPERDMZ_HOST:$SUPERDMZ_PORT"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "SuperDMZ public TCP endpoint did not become reachable"
+              sudo superdmz -status || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          printf 'ready run=%s time=%s host=%s port=%s\n'             "${{ github.run_id }}"             "$(date -u +%FT%TZ)"             "$SUPERDMZ_HOST"             "$SUPERDMZ_PORT" >/tmp/ready.txt
 
       - name: Publish worker READY signal
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -184,12 +188,14 @@ jobs:
           compression-level: 0
 
       - name: Wait until rotation
-        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         run: |
           set -euo pipefail
           target=$(($(date +%s) + HANDOVER_AT))
-          while [ "$(date +%s)" -lt "$target" ]; do sleep 30; done
+          echo "Worker will hand over after $HANDOVER_AT seconds"
+          while [ "$(date +%s)" -lt "$target" ]; do
+            sleep 30
+          done
 
       - name: Save encrypted persistent snapshot
         shell: bash
@@ -197,11 +203,20 @@ jobs:
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
         run: |
           set -euo pipefail
+          test -n "$STATE_KEY" || {
+            echo "Missing GitHub secret: VPS_STATE_KEY"
+            exit 1
+          }
+
           command -v pm2 >/dev/null 2>&1 && sudo pm2 save || true
-          sudo tar -cpf /tmp/vps-state.tar /opt/vps-data /root/.pm2 /root/.ssh/authorized_keys /etc/ssh/ssh_host_* 2>/dev/null || true
+
+          sudo tar -cpf /tmp/vps-state.tar             /opt/vps-data             /root/.pm2             /root/.ssh/authorized_keys             /etc/ssh/ssh_host_*             2>/dev/null || true
+
           printf '%s' "$STATE_KEY" >/tmp/state-pass
           chmod 600 /tmp/state-pass
-          gpg --batch --yes --pinentry-mode loopback --passphrase-file /tmp/state-pass --symmetric --cipher-algo AES256 --output "$STATE_FILE" /tmp/vps-state.tar
+
+          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --symmetric --cipher-algo AES256             --output "$STATE_FILE" /tmp/vps-state.tar
+
           rm -f /tmp/state-pass /tmp/vps-state.tar
           sudo chmod 600 "$STATE_FILE"
 
@@ -219,23 +234,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run vps.yml --repo "$REPO" --ref main -f mode=handover -f source_run_id="${{ github.run_id }}"
+          gh workflow run vps.yml             --repo "$REPO"             --ref main             -f mode=handover             -f source_run_id="${{ github.run_id }}"
           echo "NEXT WORKER DISPATCHED"
 
       - name: Wait for replacement READY
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
-          for i in $(seq 1 150); do
-            count=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/artifacts?name=handover-ready-${{ github.run_id }}&per_page=1" --jq '.artifacts | length' 2>/dev/null || echo 0)
+          for i in $(seq 1 180); do
+            count=$(gh api               -H "Accept: application/vnd.github+json"               "/repos/$REPO/actions/artifacts?name=handover-ready-${{ github.run_id }}&per_page=1"               --jq '.artifacts | length' 2>/dev/null || echo 0)
+
             if [ "$count" -gt 0 ]; then
               echo "REPLACEMENT WORKER READY"
               exit 0
             fi
+
             sleep 10
           done
+
           echo "Replacement worker did not report READY"
           exit 1
 
