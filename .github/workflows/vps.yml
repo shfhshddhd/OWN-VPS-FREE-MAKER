@@ -119,10 +119,7 @@ jobs:
           chmod 600 /tmp/state-pass
           gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --decrypt /tmp/previous-state/vps-state.tar.gpg >/tmp/restore.tar
 
-          # IMPORTANT: do not restore the old Tailscale state while the old
-          # worker is still online. Tailscale warns that cloning node state
-          # creates duplicate node identities/IPs.
-          sudo tar -xpf /tmp/restore.tar -C /             --exclude='var/lib/tailscale'             --exclude='opt/vps-data/tailscale-state.tar'             --exclude='etc/ssh/ssh_host_*'
+          sudo tar -xpf /tmp/restore.tar -C / --exclude='etc/ssh/ssh_host_*'
 
           sudo mkdir -p /opt/vps-data
           sudo mv /tmp/restore.tar /tmp/restore.tar.done
