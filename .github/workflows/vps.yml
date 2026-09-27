@@ -1,0 +1,264 @@
+name: OWN VPS - Rolling 24/7 Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Deployment mode"
+        required: true
+        default: "initial"
+        type: choice
+        options:
+          - initial
+          - handover
+      source_run_id:
+        description: "Previous worker run ID used for state restore"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  artifact-metadata: write
+
+jobs:
+  vps:
+    name: VPS Worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+
+    env:
+      VPS_ROOT: /opt/vps-data
+      STATE_FILE: /tmp/vps-state.tar.gpg
+      HANDOVER_AT: 31800
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Prepare base system
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y             openssh-server curl jq git rsync gpg tar ca-certificates
+          sudo mkdir -p "$VPS_ROOT"
+          sudo chmod 755 "$VPS_ROOT"
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          echo "Base VPS environment ready"
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          echo "Tailscale installed"
+
+      - name: Check required secrets
+        shell: bash
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+          SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+        run: |
+          set -euo pipefail
+          test -n "$TS_KEY" || { echo "Missing secret: TAILSCALE_AUTHKEY"; exit 1; }
+          test -n "$STATE_KEY" || { echo "Missing secret: VPS_STATE_KEY"; exit 1; }
+          test -n "$SSH_KEYS" || { echo "Missing secret: SSH_AUTHORIZED_KEYS"; exit 1; }
+
+      - name: Join temporary management network
+        shell: bash
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          sudo tailscale up --auth-key="$TS_KEY" --hostname="own-vps-worker-${{ github.run_id }}"
+          sudo tailscale ip -4 | tee /tmp/temp-ts-ip
+          echo "Temporary worker Tailscale IP: $(cat /tmp/temp-ts-ip)"
+
+      - name: Configure hardened SSH
+        shell: bash
+        env:
+          SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /root/.ssh
+          printf '%s\n' "$SSH_KEYS" | sudo tee /root/.ssh/authorized_keys >/dev/null
+          sudo chmod 700 /root/.ssh
+          sudo chmod 600 /root/.ssh/authorized_keys
+
+          sudo install -d -m 755 /etc/ssh/sshd_config.d
+          sudo tee /etc/ssh/sshd_config.d/99-own-vps.conf >/dev/null <<'EOF'
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          ChallengeResponseAuthentication no
+          UsePAM yes
+          X11Forwarding no
+          AllowTcpForwarding yes
+          ClientAliveInterval 60
+          ClientAliveCountMax 3
+          EOF
+
+          sudo sshd -t
+          sudo systemctl restart ssh
+
+      - name: Restore previous VPS snapshot
+        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-state-${{ inputs.source_run_id }}
+          path: /tmp/previous-state
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Decrypt and restore previous state
+        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+        shell: bash
+        env:
+          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -f "/tmp/previous-state/state.tar.gpg"
+          printf '%s' "$STATE_KEY" >/tmp/state-pass
+          chmod 600 /tmp/state-pass
+          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --decrypt "/tmp/previous-state/state.tar.gpg" >/tmp/restore.tar
+          sudo tar -xpf /tmp/restore.tar -C /
+          rm -f /tmp/state-pass /tmp/restore.tar
+          echo "Persistent VPS state restored"
+
+      - name: Reconnect persistent Tailscale identity after old worker is released
+        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+        shell: bash
+        env:
+          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for previous worker to release the persistent identity..."
+          for i in $(seq 1 90); do
+            if sudo test -f /opt/vps-data/.handover-release-${{ inputs.source_run_id }}; then
+              break
+            fi
+            sleep 10
+          done
+          if ! sudo test -f /opt/vps-data/.handover-release-${{ inputs.source_run_id }}; then
+            echo "Previous worker did not release identity in time"
+            exit 1
+          fi
+
+          sudo tailscale logout || true
+          sudo systemctl stop tailscaled || true
+          sudo rm -rf /var/lib/tailscale
+          sudo mkdir -p /var/lib/tailscale
+          sudo tar -xpf /opt/vps-data/tailscale-state.tar -C / 2>/dev/null || true
+          sudo systemctl start tailscaled
+          sleep 5
+          sudo tailscale status
+          sudo tailscale ip -4 | tee /tmp/active-ts-ip
+
+      - name: Restore PM2 and applications
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f /root/.pm2/dump.pm2 ]; then
+            if ! command -v pm2 >/dev/null 2>&1; then
+              sudo npm install -g pm2
+            fi
+            sudo pm2 resurrect || true
+          fi
+          echo "Application restoration complete"
+
+      - name: VPS readiness gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl is-active --quiet ssh
+          sudo systemctl is-active --quiet tailscaled
+          test -d "$VPS_ROOT"
+          if command -v pm2 >/dev/null 2>&1; then
+            sudo pm2 ping || true
+          fi
+          echo "VPS READY"
+          echo "Tailscale IP: $(sudo tailscale ip -4 | head -n1)"
+
+      - name: Publish READY signal
+        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'ready run=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)"             | tee /tmp/ready.txt
+          echo "New worker is READY"
+
+      - name: Save persistent state before rotation
+        shell: bash
+        env:
+          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$VPS_ROOT"
+          if command -v pm2 >/dev/null 2>&1; then
+            sudo pm2 save || true
+          fi
+
+          # Keep the persistent Tailscale identity inside the encrypted snapshot.
+          sudo tar -cpf /opt/vps-data/tailscale-state.tar /var/lib/tailscale 2>/dev/null || true
+
+          sudo tar -cpf /tmp/vps-state.tar             /opt/vps-data             /root/.pm2             /root/.ssh/authorized_keys             /etc/ssh/ssh_host_*             2>/dev/null || true
+
+          printf '%s' "$STATE_KEY" >/tmp/state-pass
+          chmod 600 /tmp/state-pass
+          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --symmetric --cipher-algo AES256             --output "$STATE_FILE" /tmp/vps-state.tar
+          rm -f /tmp/state-pass /tmp/vps-state.tar
+          sudo chmod 600 "$STATE_FILE"
+          echo "Encrypted persistent state snapshot created"
+
+      - name: Upload encrypted persistent state
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-state-${{ github.run_id }}
+          path: /tmp/vps-state.tar.gpg
+          retention-days: 7
+          compression-level: 0
+
+      - name: Trigger next worker before this worker expires
+        if: ${{ inputs.mode != 'handover' || inputs.mode == 'handover' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Starting next worker from current run ${{ github.run_id }}"
+          gh workflow run vps.yml             --repo "$REPO"             --ref main             -f mode=handover             -f source_run_id="${{ github.run_id }}"
+          echo "Next worker dispatch submitted"
+
+      - name: Wait for safe handover window
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Waiting for the replacement worker to become READY..."
+          sleep 120
+
+      - name: Release persistent identity and finish old worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch "$VPS_ROOT/.handover-release-${{ github.run_id }}"
+          echo "HANDOVER RELEASED"
+          echo "The replacement worker may now take the persistent identity."
+          sleep 30
+
+      - name: Keep worker alive until planned expiry
+        shell: bash
+        run: |
+          set -euo pipefail
+          while true; do
+            elapsed=$(awk '{print int($1)}' /proc/uptime)
+            if [ "$elapsed" -ge "$HANDOVER_AT" ]; then
+              echo "Planned worker lifetime reached"
+              break
+            fi
+            sleep 30
+          done
