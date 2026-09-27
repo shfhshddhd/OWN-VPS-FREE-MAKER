@@ -1,5 +1,4 @@
 name: OWN VPS - Rolling Mongo Live Sync
-
 on:
   workflow_dispatch:
     inputs:
@@ -14,17 +13,14 @@ on:
         required: false
         default: ""
         type: string
-
 permissions:
   actions: write
   contents: read
-
 jobs:
   vps:
     name: VPS Worker
     runs-on: ubuntu-24.04
     timeout-minutes: 350
-
     env:
       REPO: ${{ github.repository }}
       VPS_ROOT: /opt/vps-data
@@ -32,9 +28,7 @@ jobs:
       SUPERDMZ_PORT: 16740
       PREWARM_AT: 18000
       SYNC_INTERVAL: 15
-      MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
       MONGO_DB: own_vps
-
     steps:
       - name: Prepare base system
         shell: bash
@@ -45,27 +39,25 @@ jobs:
           sudo mkdir -p "$VPS_ROOT"
           sudo chmod 755 "$VPS_ROOT"
           sudo systemctl enable --now ssh
-
       - name: Check required secrets
         shell: bash
         env:
           SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
           SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
           test -n "$SUPERDMZ_TOKEN" || { echo "Missing SUPERDMZ_TOKEN"; exit 1; }
           test -n "$SSH_KEYS" || { echo "Missing SSH_AUTHORIZED_KEYS"; exit 1; }
           test -n "$STATE_KEY" || { echo "Missing VPS_STATE_KEY"; exit 1; }
-          test -n "$MONGO_URI" || { echo "Missing MONGODB_URI (or MONGO_URI)"; exit 1; }
-
+          test -n "$MONGO_URI" || { echo "Missing MONGODB_URI or MONGO_URI"; exit 1; }
       - name: Install Mongo sync runtime
         shell: bash
         run: |
           set -euo pipefail
           python3 -m venv /opt/vps-sync-venv
           /opt/vps-sync-venv/bin/pip install --disable-pip-version-check --quiet "pymongo>=4.13,<5"
-
       - name: Install and connect SuperDMZ
         shell: bash
         env:
@@ -75,25 +67,18 @@ jobs:
           curl -fsSL https://superdmz.com/download/LinuxInstaller.sh | sudo sh
           sudo superdmz -add-token="$SUPERDMZ_TOKEN"
           for i in $(seq 1 45); do
-            if sudo superdmz -status 2>&1 | grep -qiE 'online|connected|active'; then
-              break
-            fi
+            if sudo superdmz -status 2>&1 | grep -qiE 'online|connected|active'; then break; fi
             sleep 2
           done
           sudo superdmz -status
           sudo superdmz -list
-
       - name: Restore latest Mongo VPS state
         shell: bash
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py restore \
-            --uri "$MONGO_URI" \
-            --db "$MONGO_DB" \
-            --runner-id "$GITHUB_RUN_ID"
-
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py restore --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID"
       - name: Configure hardened SSH
         shell: bash
         env:
@@ -117,29 +102,17 @@ jobs:
           EOF
           sudo sshd -t
           sudo systemctl restart ssh
-
-      - name: Start Mongo live sync
+      - name: Start Mongo live sync or standby mirror
         shell: bash
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          if [ "${{ inputs.mode }}" = "handover" ]; then
-            MODE=mirror
-          else
-            MODE=sync
-          fi
-          nohup /opt/vps-sync-venv/bin/python vps/mongo_sync.py "$MODE" \
-            --uri "$MONGO_URI" \
-            --db "$MONGO_DB" \
-            --runner-id "$GITHUB_RUN_ID" \
-            --generation "$GITHUB_RUN_NUMBER" \
-            --interval "$SYNC_INTERVAL" \
-            > /tmp/mongo-sync.log 2>&1 &
+          if [ "${{ inputs.mode }}" = "handover" ]; then MODE=mirror; else MODE=sync; fi
+          nohup /opt/vps-sync-venv/bin/python vps/mongo_sync.py "$MODE" --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
           echo $! >/tmp/mongo-sync.pid
           sleep 3
           cat /tmp/mongo-sync.log || true
-
       - name: VPS readiness gate
         shell: bash
         run: |
@@ -147,108 +120,79 @@ jobs:
           sudo systemctl is-active --quiet ssh
           test -d "$VPS_ROOT"
           for i in $(seq 1 30); do
-            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then
-              echo "SUPERDMZ TCP ENDPOINT REACHABLE: $SUPERDMZ_HOST:$SUPERDMZ_PORT"
-              break
-            fi
-            if [ "$i" -eq 30 ]; then
-              sudo superdmz -status || true
-              exit 1
-            fi
+            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then exit 0; fi
             sleep 2
           done
-          printf 'ready run=%s time=%s host=%s port=%s\n' \
-            "$GITHUB_RUN_ID" "$(date -u +%FT%TZ)" "$SUPERDMZ_HOST" "$SUPERDMZ_PORT" >/tmp/ready.txt
-
-      - name: Publish standby READY signal
+          sudo superdmz -status || true
+          exit 1
+      - name: Publish standby READY
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: standby-ready-${{ github.event.inputs.source_run_id }}-${{ github.run_id }}
+          name: standby-ready-${{ inputs.source_run_id }}-${{ github.run_id }}
           path: /tmp/ready.txt
           retention-days: 1
           compression-level: 0
-
-      - name: Wait until prewarm handover
+      - name: Initial worker prewarm wait
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         run: |
           set -euo pipefail
           target=$(($(date +%s) + PREWARM_AT))
-          echo "Worker will prewarm replacement after $PREWARM_AT seconds"
-          while [ "$(date +%s)" -lt "$target" ]; do
-            sleep 30
+          while [ "$(date +%s)" -lt "$target" ]; do sleep 30; done
+      - name: Initial worker dispatch replacement
+        if: ${{ inputs.mode == 'initial' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run vps.yml --repo "$REPO" --ref main -f mode=handover -f source_run_id="$GITHUB_RUN_ID"
+      - name: Initial worker find replacement
+        if: ${{ inputs.mode == 'initial' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            TARGET_RUN=$(gh run list --workflow vps.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"') | .databaseId' | head -n1 || true)
+            if [ -n "$TARGET_RUN" ]; then echo "$TARGET_RUN" >/tmp/target-run.txt; exit 0; fi
+            sleep 5
           done
-
-      - name: Start replacement worker
-        if: ${{ inputs.mode == 'initial' || inputs.source_run_id != '' }}
+          exit 1
+      - name: Initial worker wait READY
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run vps.yml \
-            --repo "$REPO" \
-            --ref main \
-            -f mode=handover \
-            -f source_run_id="$GITHUB_RUN_ID"
-          echo "REPLACEMENT DISPATCHED"
-
-      - name: Wait for replacement READY
-        if: ${{ inputs.mode == 'initial' || inputs.source_run_id != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
+          TARGET_RUN=$(cat /tmp/target-run.txt)
           for i in $(seq 1 240); do
-            count=$(gh api \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/artifacts?name=standby-ready-$GITHUB_RUN_ID-&per_page=100" \
-              --jq '.artifacts | length' 2>/dev/null || echo 0)
-            if [ "$count" -gt 0 ]; then
-              echo "REPLACEMENT READY"
-              exit 0
-            fi
+            count=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/artifacts?name=standby-ready-$GITHUB_RUN_ID-$TARGET_RUN&per_page=1" --jq '.artifacts | length' 2>/dev/null || echo 0)
+            if [ "$count" -gt 0 ]; then exit 0; fi
             sleep 10
           done
-          echo "Replacement did not report READY"
           exit 1
-
-      - name: Final Mongo sync from active worker
-        if: ${{ inputs.mode == 'initial' || inputs.source_run_id != '' }}
+      - name: Initial worker final sync
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py once \
-            --uri "$MONGO_URI" \
-            --db "$MONGO_DB" \
-            --runner-id "$GITHUB_RUN_ID" \
-            --generation "$GITHUB_RUN_NUMBER"
-
-      - name: Request verified cutover
-        if: ${{ inputs.mode == 'initial' || inputs.source_run_id != '' }}
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py once --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+      - name: Initial worker request cutover
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TARGET_RUN=$(gh run list --workflow vps.yml --repo "$REPO" --status in_progress --limit 20 \
-            --json databaseId --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"') | .databaseId' | head -n1 || true)
-          test -n "$TARGET_RUN" || { echo "Could not identify replacement run"; exit 1; }
-          echo "TARGET_RUN=$TARGET_RUN"
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover \
-            --uri "$MONGO_URI" \
-            --db "$MONGO_DB" \
-            --runner-id "$GITHUB_RUN_ID" \
-            --generation "$GITHUB_RUN_NUMBER" \
-            --target-run "$TARGET_RUN"
-          echo "$TARGET_RUN" >/tmp/target-run.txt
-
-      - name: Wait for replacement verification
-        if: ${{ inputs.mode == 'initial' || inputs.source_run_id != '' }}
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --target-run "$(cat /tmp/target-run.txt)"
+      - name: Initial worker wait VERIFIED
+        if: ${{ inputs.mode == 'initial' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -256,24 +200,120 @@ jobs:
           set -euo pipefail
           TARGET_RUN=$(cat /tmp/target-run.txt)
           for i in $(seq 1 180); do
-            count=$(gh api \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/artifacts?name=verified-$GITHUB_RUN_ID-$TARGET_RUN&per_page=1" \
-              --jq '.artifacts | length' 2>/dev/null || echo 0)
-            if [ "$count" -gt 0 ]; then
-              echo "REPLACEMENT VERIFIED"
-              exit 0
-            fi
+            count=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/artifacts?name=verified-$GITHUB_RUN_ID-$TARGET_RUN&per_page=1" --jq '.artifacts | length' 2>/dev/null || echo 0)
+            if [ "$count" -gt 0 ]; then exit 0; fi
             sleep 10
           done
-          echo "Replacement verification timeout"
           exit 1
-
-      - name: Keep worker alive until replacement takes over
+      - name: Handover stop mirror
+        if: ${{ inputs.mode == 'handover' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "Waiting for verified replacement"
-          while true; do
-            sleep 60
+          kill "$(cat /tmp/mongo-sync.pid)" 2>/dev/null || true
+      - name: Handover wait and verify cutover request
+        if: ${{ inputs.mode == 'handover' }}
+        shell: bash
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py watch-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL"
+      - name: Handover publish VERIFIED
+        if: ${{ inputs.mode == 'handover' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-${{ inputs.source_run_id }}-${{ github.run_id }}
+          path: /tmp/ready.txt
+          retention-days: 1
+          compression-level: 0
+      - name: Handover activate worker
+        if: ${{ inputs.mode == 'handover' }}
+        shell: bash
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py activate --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+      - name: Handover start active sync
+        if: ${{ inputs.mode == 'handover' }}
+        shell: bash
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          nohup /opt/vps-sync-venv/bin/python vps/mongo_sync.py sync --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
+          echo $! >/tmp/mongo-sync.pid
+      - name: Handover cancel previous worker
+        if: ${{ inputs.mode == 'handover' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/runs/${{ inputs.source_run_id }}/cancel"
+      - name: Active worker prewarm next replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=$(($(date +%s) + PREWARM_AT))
+          while [ "$(date +%s)" -lt "$target" ]; do sleep 30; done
+      - name: Active worker dispatch next
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run vps.yml --repo "$REPO" --ref main -f mode=handover -f source_run_id="$GITHUB_RUN_ID"
+      - name: Active worker find next
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            TARGET_RUN=$(gh run list --workflow vps.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"') | .databaseId' | head -n1 || true)
+            if [ -n "$TARGET_RUN" ]; then echo "$TARGET_RUN" >/tmp/target-run.txt; exit 0; fi
+            sleep 5
           done
+          exit 1
+      - name: Active worker wait next READY
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_RUN=$(cat /tmp/target-run.txt)
+          for i in $(seq 1 240); do
+            count=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/artifacts?name=standby-ready-$GITHUB_RUN_ID-$TARGET_RUN&per_page=1" --jq '.artifacts | length' 2>/dev/null || echo 0)
+            if [ "$count" -gt 0 ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
+      - name: Active worker final sync and cutover request
+        shell: bash
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          TARGET_RUN=$(cat /tmp/target-run.txt)
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py once --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+          /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --target-run "$TARGET_RUN"
+      - name: Active worker wait next VERIFIED
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_RUN=$(cat /tmp/target-run.txt)
+          for i in $(seq 1 180); do
+            count=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/artifacts?name=verified-$GITHUB_RUN_ID-$TARGET_RUN&per_page=1" --jq '.artifacts | length' 2>/dev/null || echo 0)
+            if [ "$count" -gt 0 ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
+      - name: Keep worker alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          while true; do sleep 60; done
