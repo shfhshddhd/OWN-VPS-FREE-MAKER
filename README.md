@@ -19,7 +19,7 @@ Current GitHub runner
 
 The runner is disposable. The public SSH endpoint is not tied to the runner's temporary public IP.
 
-GitHub documents that standard Linux runners in public repositories are fresh VMs with 4 CPU, 16 GB RAM and 14 GB SSD. GitHub-hosted jobs have a maximum execution time of 360 minutes, so this project performs a controlled handover before the limit. citeturn0search0turn1search0
+GitHub documents that standard Linux runners in public repositories are fresh VMs with 4 CPU, 16 GB RAM and 14 GB SSD. GitHub-hosted jobs have a maximum execution time of 360 minutes, so this project performs a controlled handover before the limit.
 
 ## Stable SSH endpoint
 
@@ -31,7 +31,7 @@ SSH is forwarded through Funnel from:
 own-vps.<your-tailnet>.ts.net:10000
 ```
 
-Port 10000 is used because Tailscale Funnel supports raw TCP forwarding on 443, 8443 and 10000. Funnel provides a predictable DNS name for a device, so the hostname can be shared once and reused when the Funnel is turned back on. citeturn4search0turn2search0
+Port 10000 is used because Tailscale Funnel supports raw TCP forwarding on 443, 8443 and 10000. Funnel provides a predictable DNS name for a device, so the hostname can be shared once and reused when the Funnel is turned back on.
 
 Termius does not need Tailscale installed for the public Funnel endpoint.
 
@@ -71,7 +71,7 @@ Never put a private SSH key in the repository or in this secret.
 
 ## Tailscale Funnel prerequisite
 
-Funnel must be enabled for the tailnet before the workflow can expose the public SSH endpoint. Tailscale requires Funnel to be permitted by the tailnet policy. citeturn4search1
+Funnel must be enabled for the tailnet before the workflow can expose the public SSH endpoint. Tailscale requires Funnel to be permitted by the tailnet policy.
 
 After the first successful run, the workflow prints the Funnel endpoint in the Actions log.
 
@@ -100,7 +100,7 @@ The workflow currently persists:
 
 The snapshot is encrypted before upload.
 
-GitHub Actions artifacts can be passed between workflow runs when the appropriate token and source run ID are supplied. citeturn3search6
+GitHub Actions artifacts can be passed between workflow runs when the appropriate token and source run ID are supplied.
 
 ## Important limitations
 
@@ -114,4 +114,4 @@ GitHub-hosted runners are disposable infrastructure. This project is designed as
 
 ## Current workflow
 
-` .github/workflows/vps.yml `
+`.github/workflows/vps.yml`
