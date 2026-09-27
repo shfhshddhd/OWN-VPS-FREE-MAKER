@@ -182,16 +182,17 @@ def restore(db, fs, roots):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["sync", "restore", "mirror", "once"])
+    ap.add_argument("mode", choices=["sync", "restore", "mirror", "once", "request-cutover", "watch-cutover"])
     ap.add_argument("--uri", required=True)
     ap.add_argument("--db", default="own_vps")
     ap.add_argument("--runner-id", default=os.getenv("GITHUB_RUN_ID", "unknown"))
     ap.add_argument("--generation", default=os.getenv("VPS_GENERATION", "0"))
     ap.add_argument("--interval", type=int, default=15)
+    ap.add_argument("--source-run", default="")
+    ap.add_argument("--target-run", default="")
     ap.add_argument("--path", action="append", dest="paths")
     args = ap.parse_args()
     roots = args.paths or DEFAULT_PATHS
-
     client, db, fs = connect(args.uri, args.db)
     try:
         if args.mode == "restore":
@@ -207,6 +208,71 @@ def main():
             )
             print(f"RESTORED_FILES={n}", flush=True)
             return 0
+
+        if args.mode == "request-cutover":
+            if not args.target_run:
+                raise SystemExit("--target-run is required")
+            db.vps_cutover.replace_one(
+                {"_id": "current"},
+                {
+                    "_id": "current",
+                    "source_run": str(args.runner_id),
+                    "target_run": str(args.target_run),
+                    "generation": str(args.generation),
+                    "requested_at": time.time(),
+                    "status": "requested",
+                },
+                upsert=True,
+            )
+            print(f"CUTOVER_REQUESTED target={args.target_run}", flush=True)
+            return 0
+
+        if args.mode == "watch-cutover":
+            if not args.target_run:
+                raise SystemExit("--target-run is required")
+            while True:
+                doc = db.vps_cutover.find_one({"_id": "current"})
+                if doc and str(doc.get("target_run")) == str(args.runner_id) and doc.get("status") == "requested":
+                    restored = restore(db, fs, roots)
+                    bad = []
+                    for item in db.vps_files.find({"deleted": False}):
+                        path = item["path"]
+                        managed = any(
+                            path == os.path.abspath(x) or
+                            (Path(x).is_dir() and path.startswith(os.path.abspath(x).rstrip("/") + "/"))
+                            for x in roots
+                        )
+                        if managed:
+                            try:
+                                if sha256_file(path) != item["sha256"]:
+                                    bad.append(path)
+                            except OSError:
+                                bad.append(path)
+                    if bad:
+                        db.vps_runners.update_one(
+                            {"_id": str(args.runner_id)},
+                            {"$set": {"status": "verification_failed", "verification_errors": bad[:20]}},
+                            upsert=True,
+                        )
+                        raise RuntimeError(f"Verification failed for {len(bad)} files")
+                    db.vps_runners.update_one(
+                        {"_id": str(args.runner_id)},
+                        {"$set": {
+                            "runner_id": str(args.runner_id),
+                            "generation": str(args.generation),
+                            "status": "verified",
+                            "verified_at": time.time(),
+                            "restored_files": restored,
+                        }},
+                        upsert=True,
+                    )
+                    db.vps_cutover.update_one(
+                        {"_id": "current"},
+                        {"$set": {"status": "verified", "verified_at": time.time()}},
+                    )
+                    print(f"CUTOVER_VERIFIED restored={restored}", flush=True)
+                    return 0
+                time.sleep(args.interval)
 
         if args.mode == "once":
             n, total = sync_once(db, fs, roots, args.runner_id, args.generation)
