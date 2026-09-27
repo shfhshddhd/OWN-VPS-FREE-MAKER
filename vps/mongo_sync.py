@@ -182,7 +182,7 @@ def restore(db, fs, roots):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["sync", "restore"])
+    ap.add_argument("mode", choices=["sync", "restore", "mirror", "once"])
     ap.add_argument("--uri", required=True)
     ap.add_argument("--db", default="own_vps")
     ap.add_argument("--runner-id", default=os.getenv("GITHUB_RUN_ID", "unknown"))
@@ -208,8 +208,39 @@ def main():
             print(f"RESTORED_FILES={n}", flush=True)
             return 0
 
+        if args.mode == "once":
+            n, total = sync_once(db, fs, roots, args.runner_id, args.generation)
+            print(f"SYNC_ONCE files={total} changed_or_checked={n}", flush=True)
+            return 0
+
+        if args.mode == "mirror":
+            while True:
+                n = restore(db, fs, roots)
+                db.vps_runners.update_one(
+                    {"_id": str(args.runner_id)},
+                    {"$set": {
+                        "runner_id": str(args.runner_id),
+                        "generation": str(args.generation),
+                        "last_mirror": time.time(),
+                        "status": "standby",
+                    }},
+                    upsert=True,
+                )
+                print(f"MIRROR restored={n}", flush=True)
+                time.sleep(args.interval)
+
         while True:
             n, total = sync_once(db, fs, roots, args.runner_id, args.generation)
+            db.vps_runners.update_one(
+                {"_id": str(args.runner_id)},
+                {"$set": {
+                    "runner_id": str(args.runner_id),
+                    "generation": str(args.generation),
+                    "last_sync": time.time(),
+                    "status": "active",
+                }},
+                upsert=True,
+            )
             print(f"SYNC files={total} changed_or_checked={n}", flush=True)
             time.sleep(args.interval)
     finally:
