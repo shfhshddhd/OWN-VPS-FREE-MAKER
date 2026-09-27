@@ -182,7 +182,7 @@ def restore(db, fs, roots):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["sync", "restore", "mirror", "once", "request-cutover", "watch-cutover"])
+    ap.add_argument("mode", choices=["sync", "restore", "mirror", "once", "request-cutover", "watch-cutover", "activate"])
     ap.add_argument("--uri", required=True)
     ap.add_argument("--db", default="own_vps")
     ap.add_argument("--runner-id", default=os.getenv("GITHUB_RUN_ID", "unknown"))
@@ -327,6 +327,32 @@ def main():
                     print(f"CUTOVER_VERIFIED restored={restored}", flush=True)
                     return 0
                 time.sleep(args.interval)
+
+        if args.mode == "activate":
+            doc = db.vps_cutover.find_one({"_id": "current"})
+            if not doc or str(doc.get("target_run")) != str(args.runner_id) or doc.get("status") != "verified":
+                raise RuntimeError("Cutover is not verified for this runner")
+            db.vps_meta.update_one(
+                {"_id": "live"},
+                {"$set": {
+                    "active_runner": str(args.runner_id),
+                    "generation": str(args.generation),
+                    "status": "active",
+                    "activated_at": time.time(),
+                }},
+                upsert=True,
+            )
+            db.vps_runners.update_one(
+                {"_id": str(args.runner_id)},
+                {"$set": {"status": "active", "activated_at": time.time()}},
+                upsert=True,
+            )
+            db.vps_cutover.update_one(
+                {"_id": "current"},
+                {"$set": {"status": "activated", "activated_at": time.time()}},
+            )
+            print("CUTOVER_ACTIVATED", flush=True)
+            return 0
 
         if args.mode == "once":
             n, total = sync_once(db, fs, roots, args.runner_id, args.generation)
