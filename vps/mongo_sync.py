@@ -229,8 +229,6 @@ def main():
             return 0
 
         if args.mode == "watch-cutover":
-            if not args.target_run:
-                raise SystemExit("--target-run is required")
             while True:
                 doc = db.vps_cutover.find_one({"_id": "current"})
                 if doc and str(doc.get("target_run")) == str(args.runner_id) and doc.get("status") == "requested":
@@ -240,7 +238,7 @@ def main():
                         path = item["path"]
                         managed = any(
                             path == os.path.abspath(x) or
-                            (Path(x).is_dir() and path.startswith(os.path.abspath(x).rstrip("/") + "/"))
+                            path.startswith(os.path.abspath(x).rstrip("/") + "/")
                             for x in roots
                         )
                         if managed:
