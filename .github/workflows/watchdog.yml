@@ -1,0 +1,34 @@
+name: OWN VPS - Recovery Watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check VPS workers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          active=$(gh run list --workflow vps.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')
+          queued=$(gh run list --workflow vps.yml --repo "$REPO" --status queued --limit 20 --json databaseId --jq 'length')
+
+          echo "in_progress=$active queued=$queued"
+
+          if [ "$active" -eq 0 ] && [ "$queued" -eq 0 ]; then
+            echo "NO VPS WORKER FOUND - STARTING RECOVERY WORKER"
+            gh workflow run vps.yml --repo "$REPO" --ref main -f mode=initial -f source_run_id=""
+          else
+            echo "VPS WORKER PRESENT - NO RECOVERY NEEDED"
+          fi
