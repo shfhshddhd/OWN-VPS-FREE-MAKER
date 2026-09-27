@@ -111,31 +111,6 @@ jobs:
           kill -0 "$(cat /tmp/relay-tunnel.pid)" 2>/dev/null || { cat /tmp/relay-tunnel.log; exit 1; }
           echo "RELAY TUNNEL READY"
 
-      - name: Activate this worker on the fixed relay
-        shell: bash
-        env:
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-          RELAY_CONTROL_PRIVATE_KEY: ${{ secrets.RELAY_CONTROL_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          TUNNEL_PORT="$(cat /tmp/relay_port)"
-          install -d -m 700 /tmp/relay-control
-          printf "%s\n" "$RELAY_CONTROL_PRIVATE_KEY" >/tmp/relay-control/control_key
-          chmod 600 /tmp/relay-control/control_key
-          ssh-keyscan -T 10 -H "$RELAY_HOST" >>/tmp/relay-control/known_hosts 2>/dev/null
-          chmod 600 /tmp/relay-control/known_hosts
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/relay-control/known_hosts -i /tmp/relay-control/control_key relay-control@"$RELAY_HOST" "activate ${TUNNEL_PORT}"
-          echo "FIXED RELAY ENDPOINT NOW POINTS TO THIS WORKER"
-
-      - name: Verify fixed relay SSH path
-        shell: bash
-        env:
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-        run: |
-          set -euo pipefail
-          timeout 10 bash -c "cat < /dev/null > /dev/tcp/${RELAY_HOST}/2222"
-          echo "FIXED RELAY TCP ENDPOINT IS REACHABLE"
-
       - name: Download previous encrypted state
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
         uses: actions/download-artifact@v4
@@ -206,6 +181,32 @@ jobs:
             fi
             sudo pm2 resurrect || true
           fi
+      - name: Activate this worker on the fixed relay
+        shell: bash
+        env:
+          RELAY_HOST: ${{ secrets.RELAY_HOST }}
+          RELAY_CONTROL_PRIVATE_KEY: ${{ secrets.RELAY_CONTROL_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          TUNNEL_PORT="$(cat /tmp/relay_port)"
+          install -d -m 700 /tmp/relay-control
+          printf "%s\n" "$RELAY_CONTROL_PRIVATE_KEY" >/tmp/relay-control/control_key
+          chmod 600 /tmp/relay-control/control_key
+          ssh-keyscan -T 10 -H "$RELAY_HOST" >>/tmp/relay-control/known_hosts 2>/dev/null
+          chmod 600 /tmp/relay-control/known_hosts
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/relay-control/known_hosts -i /tmp/relay-control/control_key relay-control@"$RELAY_HOST" "activate ${TUNNEL_PORT}"
+          echo "FIXED RELAY ENDPOINT NOW POINTS TO THIS WORKER"
+
+      - name: Verify fixed relay SSH path
+        shell: bash
+        env:
+          RELAY_HOST: ${{ secrets.RELAY_HOST }}
+        run: |
+          set -euo pipefail
+          timeout 10 bash -c "cat < /dev/null > /dev/tcp/${RELAY_HOST}/2222"
+          echo "FIXED RELAY TCP ENDPOINT IS REACHABLE"
+
+
       - name: Save encrypted persistent VPS snapshot
         shell: bash
         env:
