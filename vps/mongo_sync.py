@@ -100,6 +100,7 @@ def upload_if_changed(fs, files, path, runner_id, generation):
                 "sha256": digest,
                 "size": after.st_size,
                 "mtime_ns": after.st_mtime_ns,
+                "mode": stat.S_IMODE(after.st_mode),
                 "file_id": fid,
                 "deleted": False,
                 "runner_id": runner_id,
@@ -159,7 +160,7 @@ def restore(db, fs, roots):
         path = doc["path"]
         managed = any(
             path == os.path.abspath(x) or
-            (Path(x).is_dir() and path.startswith(os.path.abspath(x).rstrip("/") + "/"))
+            path.startswith(os.path.abspath(x).rstrip("/") + "/")
             for x in roots
         )
         if not managed:
@@ -174,7 +175,7 @@ def restore(db, fs, roots):
             out.write(fs.get(fid).read())
         os.replace(tmp, target)
         try:
-            os.chmod(target, doc.get("mode", os.stat(target).st_mode) & 0o7777)
+            os.chmod(target, int(doc.get("mode", 0o600)))
         except OSError:
             pass
         restored += 1
