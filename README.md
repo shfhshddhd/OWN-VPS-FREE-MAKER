@@ -4,7 +4,7 @@ This repository builds an experimental rolling VPS-style worker on GitHub-hosted
 
 ## Current architecture
 
-GitHub-hosted runners are temporary VMs. GitHub documents that public repositories currently receive standard Ubuntu runners with 4 CPU and 16 GB RAM, and that each job runs on a fresh VM. GitHub-hosted jobs have a 6-hour execution limit. citeturn0search0turn1search1
+GitHub-hosted runners are temporary VMs. GitHub documents that public repositories currently receive standard Ubuntu runners with 4 CPU and 16 GB RAM, and that each job runs on a fresh VM. GitHub-hosted jobs have a 6-hour execution limit.
 
 This project therefore treats every runner as a disposable worker:
 
@@ -20,15 +20,15 @@ Before the current worker reaches the limit, it:
 6. The old worker publishes a RELEASE signal
 7. The replacement may then restore the persistent network identity and take over
 
-GitHub confirms that `workflow_dispatch` can be triggered from a workflow using `GITHUB_TOKEN`, and that this exception creates a new workflow run. citeturn11search0turn11search1
+GitHub confirms that `workflow_dispatch` can be triggered from a workflow using `GITHUB_TOKEN`, and that this exception creates a new workflow run.
 
 ## Network
 
 The management network uses Tailscale.
 
-Tailscale assigns a stable IP to a registered node. The IP remains stable while that node remains registered; losing the node state causes a new identity/IP. citeturn6search6
+Tailscale assigns a stable IP to a registered node. The IP remains stable while that node remains registered; losing the node state causes a new identity/IP.
 
-The workflow deliberately does **not** clone the Tailscale node state while the old worker is still active. Tailscale documents that cloning node state can create duplicate node identities/IPs. citeturn6search0
+The workflow deliberately does **not** clone the Tailscale node state while the old worker is still active. Tailscale documents that cloning node state can create duplicate node identities/IPs.
 
 The intended handover is:
 
@@ -87,7 +87,7 @@ The workflow persists:
 
 The snapshot is encrypted with `VPS_STATE_KEY` before it is uploaded.
 
-GitHub artifacts are designed to persist files between workflow runs and can be downloaded by a later run with the appropriate token/run ID. citeturn3search3turn7search0
+GitHub artifacts are designed to persist files between workflow runs and can be downloaded by a later run with the appropriate token/run ID.
 
 ## Important limitation
 
@@ -97,4 +97,4 @@ A GitHub-hosted runner cannot have its live RAM, kernel state, open TCP sockets,
 
 The design provides rolling worker replacement and persistent filesystem/application state. Applications such as Telegram bots may still need to reconnect after the worker handover.
 
-A true permanent production VPS should use a persistent VM/cloud server or a self-hosted runner. GitHub-hosted runners are intentionally disposable. citeturn1search11
+A true permanent production VPS should use a persistent VM/cloud server or a self-hosted runner. GitHub-hosted runners are intentionally disposable.
