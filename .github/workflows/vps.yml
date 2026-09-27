@@ -8,9 +8,7 @@ on:
         required: true
         default: "initial"
         type: choice
-        options:
-          - initial
-          - handover
+        options: [initial, handover]
       source_run_id:
         description: "Previous worker run ID used for state restore"
         required: false
@@ -27,7 +25,6 @@ jobs:
     name: VPS Worker
     runs-on: ubuntu-24.04
     timeout-minutes: 350
-
     env:
       VPS_ROOT: /opt/vps-data
       STATE_FILE: /tmp/vps-state.tar.gpg
@@ -40,11 +37,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y             openssh-server curl jq git rsync gpg tar ca-certificates
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server curl jq git rsync gpg tar ca-certificates
           sudo mkdir -p "$VPS_ROOT"
           sudo chmod 755 "$VPS_ROOT"
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
+          sudo systemctl enable --now ssh
 
       - name: Check relay prerequisites
         shell: bash
@@ -57,12 +53,10 @@ jobs:
           SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
         run: |
           set -euo pipefail
-          test -n "$RELAY_HOST" || { echo "Missing secret: RELAY_HOST"; exit 1; }
-          test -n "$RELAY_USER" || { echo "Missing secret: RELAY_USER"; exit 1; }
-          test -n "$RELAY_TUNNEL_PRIVATE_KEY" || { echo "Missing secret: RELAY_TUNNEL_PRIVATE_KEY"; exit 1; }
-          test -n "$RELAY_CONTROL_PRIVATE_KEY" || { echo "Missing secret: RELAY_CONTROL_PRIVATE_KEY"; exit 1; }
-          test -n "$STATE_KEY" || { echo "Missing secret: VPS_STATE_KEY"; exit 1; }
-          test -n "$SSH_KEYS" || { echo "Missing secret: SSH_AUTHORIZED_KEYS"; exit 1; }
+          for pair in             "RELAY_HOST:$RELAY_HOST"             "RELAY_USER:$RELAY_USER"             "RELAY_TUNNEL_PRIVATE_KEY:$RELAY_TUNNEL_PRIVATE_KEY"             "RELAY_CONTROL_PRIVATE_KEY:$RELAY_CONTROL_PRIVATE_KEY"             "VPS_STATE_KEY:$STATE_KEY"             "SSH_AUTHORIZED_KEYS:$SSH_KEYS"; do
+            name="${pair%%:*}"; value="${pair#*:}"
+            test -n "$value" || { echo "Missing secret: $name"; exit 1; }
+          done
 
       - name: Configure hardened SSH
         shell: bash
@@ -70,11 +64,9 @@ jobs:
           SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
         run: |
           set -euo pipefail
-          sudo mkdir -p /root/.ssh
+          sudo install -d -m 700 /root/.ssh
           printf '%s\n' "$SSH_KEYS" | sudo tee /root/.ssh/authorized_keys >/dev/null
-          sudo chmod 700 /root/.ssh
           sudo chmod 600 /root/.ssh/authorized_keys
-
           sudo install -d -m 755 /etc/ssh/sshd_config.d
           sudo tee /etc/ssh/sshd_config.d/99-own-vps.conf >/dev/null <<'EOF'
           PermitRootLogin prohibit-password
@@ -90,7 +82,7 @@ jobs:
           sudo sshd -t
           sudo systemctl restart ssh
 
-      - name: Establish relay tunnel
+      - name: Establish reverse SSH tunnel to relay
         shell: bash
         env:
           RELAY_HOST: ${{ secrets.RELAY_HOST }}
@@ -99,13 +91,13 @@ jobs:
         run: |
           set -euo pipefail
           install -d -m 700 /tmp/relay-ssh
-          printf "%s\n" "$RELAY_TUNNEL_PRIVATE_KEY" >/tmp/relay-ssh/tunnel_key
+          printf '%s\n' "$RELAY_TUNNEL_PRIVATE_KEY" >/tmp/relay-ssh/tunnel_key
           chmod 600 /tmp/relay-ssh/tunnel_key
           TUNNEL_PORT=$((20000 + (GITHUB_RUN_ID % 9000)))
           echo "$TUNNEL_PORT" >/tmp/relay_port
           ssh-keyscan -T 10 -H "$RELAY_HOST" >>/tmp/relay-ssh/known_hosts 2>/dev/null
           chmod 600 /tmp/relay-ssh/known_hosts
-          nohup ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/relay-ssh/known_hosts -i /tmp/relay-ssh/tunnel_key -R "127.0.0.1:${TUNNEL_PORT}:127.0.0.1:22" "${RELAY_USER}@${RELAY_HOST}" >/tmp/relay-tunnel.log 2>&1 &
+          nohup ssh -N             -o BatchMode=yes             -o ExitOnForwardFailure=yes             -o ServerAliveInterval=20             -o ServerAliveCountMax=3             -o StrictHostKeyChecking=yes             -o UserKnownHostsFile=/tmp/relay-ssh/known_hosts             -i /tmp/relay-ssh/tunnel_key             -R "127.0.0.1:$TUNNEL_PORT:127.0.0.1:22"             "$RELAY_USER@$RELAY_HOST" >/tmp/relay-tunnel.log 2>&1 &
           echo $! >/tmp/relay-tunnel.pid
           sleep 3
           kill -0 "$(cat /tmp/relay-tunnel.pid)" 2>/dev/null || { cat /tmp/relay-tunnel.log; exit 1; }
@@ -121,7 +113,7 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
 
-      - name: Restore application state without cloning live network identity
+      - name: Restore application state
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
         shell: bash
         env:
@@ -131,14 +123,10 @@ jobs:
           test -f /tmp/previous-state/vps-state.tar.gpg
           printf '%s' "$STATE_KEY" >/tmp/state-pass
           chmod 600 /tmp/state-pass
-          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --decrypt /tmp/previous-state/vps-state.tar.gpg >/tmp/restore.tar
-
+          gpg --batch --yes --pinentry-mode loopback --passphrase-file /tmp/state-pass --decrypt /tmp/previous-state/vps-state.tar.gpg >/tmp/restore.tar
           sudo tar -xpf /tmp/restore.tar -C / --exclude='etc/ssh/ssh_host_*'
-
-          sudo mkdir -p /opt/vps-data
-          sudo mv /tmp/restore.tar /tmp/restore.tar.done
-          rm -f /tmp/state-pass
-          echo "Application and filesystem state restored"
+          rm -f /tmp/state-pass /tmp/restore.tar
+          echo "Application state restored"
 
       - name: VPS readiness gate
         shell: bash
@@ -146,28 +134,7 @@ jobs:
           set -euo pipefail
           sudo systemctl is-active --quiet ssh
           test -d "$VPS_ROOT"
-          echo "WORKER READY FOR RELAY HANDOVER"
           printf 'ready run=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/ready.txt
-
-      - name: Publish worker READY signal
-        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: handover-ready-${{ inputs.source_run_id }}
-          path: /tmp/ready.txt
-          retention-days: 1
-          compression-level: 0
-
-      - name: Wait until the current worker is ready to rotate
-        if: ${{ inputs.mode == 'initial' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          start=$(date +%s)
-          target=$((start + HANDOVER_AT))
-          while [ "$(date +%s)" -lt "$target" ]; do
-            sleep 30
-          done
 
       - name: Restore PM2
         if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
@@ -181,7 +148,8 @@ jobs:
             fi
             sudo pm2 resurrect || true
           fi
-      - name: Activate this worker on the fixed relay
+
+      - name: Activate this worker on fixed relay
         shell: bash
         env:
           RELAY_HOST: ${{ secrets.RELAY_HOST }}
@@ -190,42 +158,54 @@ jobs:
           set -euo pipefail
           TUNNEL_PORT="$(cat /tmp/relay_port)"
           install -d -m 700 /tmp/relay-control
-          printf "%s\n" "$RELAY_CONTROL_PRIVATE_KEY" >/tmp/relay-control/control_key
+          printf '%s\n' "$RELAY_CONTROL_PRIVATE_KEY" >/tmp/relay-control/control_key
           chmod 600 /tmp/relay-control/control_key
           ssh-keyscan -T 10 -H "$RELAY_HOST" >>/tmp/relay-control/known_hosts 2>/dev/null
           chmod 600 /tmp/relay-control/known_hosts
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/relay-control/known_hosts -i /tmp/relay-control/control_key relay-control@"$RELAY_HOST" "activate ${TUNNEL_PORT}"
-          echo "FIXED RELAY ENDPOINT NOW POINTS TO THIS WORKER"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/relay-control/known_hosts             -i /tmp/relay-control/control_key relay-control@"$RELAY_HOST" "activate $TUNNEL_PORT"
+          echo "FIXED RELAY NOW POINTS TO THIS WORKER"
 
-      - name: Verify fixed relay SSH path
+      - name: Verify fixed relay TCP endpoint
         shell: bash
         env:
           RELAY_HOST: ${{ secrets.RELAY_HOST }}
         run: |
           set -euo pipefail
-          timeout 10 bash -c "cat < /dev/null > /dev/tcp/${RELAY_HOST}/2222"
+          timeout 10 bash -c "cat </dev/null >/dev/tcp/$RELAY_HOST/2222"
           echo "FIXED RELAY TCP ENDPOINT IS REACHABLE"
 
+      - name: Publish worker READY signal
+        if: ${{ inputs.mode == 'handover' && inputs.source_run_id != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: handover-ready-${{ inputs.source_run_id }}
+          path: /tmp/ready.txt
+          retention-days: 1
+          compression-level: 0
 
-      - name: Save encrypted persistent VPS snapshot
+      - name: Wait until rotation
+        if: ${{ inputs.mode == 'initial' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=$(($(date +%s) + HANDOVER_AT))
+          while [ "$(date +%s)" -lt "$target" ]; do sleep 30; done
+
+      - name: Save encrypted persistent snapshot
         shell: bash
         env:
           STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
         run: |
           set -euo pipefail
-          if command -v pm2 >/dev/null 2>&1; then
-            sudo pm2 save || true
-          fi
-
-          sudo tar -cpf /tmp/vps-state.tar             /opt/vps-data             /root/.pm2             /root/.ssh/authorized_keys             /etc/ssh/ssh_host_*             2>/dev/null || true
-
+          command -v pm2 >/dev/null 2>&1 && sudo pm2 save || true
+          sudo tar -cpf /tmp/vps-state.tar /opt/vps-data /root/.pm2 /root/.ssh/authorized_keys /etc/ssh/ssh_host_* 2>/dev/null || true
           printf '%s' "$STATE_KEY" >/tmp/state-pass
           chmod 600 /tmp/state-pass
-          gpg --batch --yes --pinentry-mode loopback             --passphrase-file /tmp/state-pass             --symmetric --cipher-algo AES256             --output "$STATE_FILE" /tmp/vps-state.tar
+          gpg --batch --yes --pinentry-mode loopback --passphrase-file /tmp/state-pass --symmetric --cipher-algo AES256 --output "$STATE_FILE" /tmp/vps-state.tar
           rm -f /tmp/state-pass /tmp/vps-state.tar
           sudo chmod 600 "$STATE_FILE"
 
-      - name: Upload encrypted state for the next worker
+      - name: Upload encrypted state
         uses: actions/upload-artifact@v4
         with:
           name: vps-state-${{ github.run_id }}
@@ -233,26 +213,25 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-      - name: Start the next worker
+      - name: Start next worker
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run vps.yml             --repo "$REPO"             --ref main             -f mode=handover             -f source_run_id="${{ github.run_id }}"
+          gh workflow run vps.yml --repo "$REPO" --ref main -f mode=handover -f source_run_id="${{ github.run_id }}"
           echo "NEXT WORKER DISPATCHED"
 
-      - name: Wait for next worker READY signal
+      - name: Wait for replacement READY
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "Waiting for replacement worker..."
           for i in $(seq 1 150); do
-            count=$(gh api               -H "Accept: application/vnd.github+json"               "/repos/$REPO/actions/artifacts?name=handover-ready-${{ github.run_id }}&per_page=1"               --jq '.artifacts | length' 2>/dev/null || echo 0)
+            count=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/actions/artifacts?name=handover-ready-${{ github.run_id }}&per_page=1" --jq '.artifacts | length' 2>/dev/null || echo 0)
             if [ "$count" -gt 0 ]; then
-              echo "A replacement worker has reported READY"
+              echo "REPLACEMENT WORKER READY"
               exit 0
             fi
             sleep 10
@@ -260,26 +239,10 @@ jobs:
           echo "Replacement worker did not report READY"
           exit 1
 
-      - name: Release old worker
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Old worker release stage completed."
-          printf 'release source=%s time=%s\n' "${{ github.run_id }}" "$(date -u +%FT%TZ)" >/tmp/release.txt
-
-      - name: Publish RELEASE signal
-        uses: actions/upload-artifact@v4
-        with:
-          name: handover-release-${{ github.run_id }}
-          path: /tmp/release.txt
-          retention-days: 1
-          compression-level: 0
-
       - name: Finish old worker
         shell: bash
         run: |
           set -euo pipefail
-          echo "Old worker is now draining"
           sudo pm2 save 2>/dev/null || true
+          echo "OLD WORKER DRAINING"
           sleep 30
-          echo "OLD WORKER STOPPING"
