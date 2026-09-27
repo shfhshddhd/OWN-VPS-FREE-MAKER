@@ -30,6 +30,9 @@ jobs:
       SYNC_INTERVAL: 15
       MONGO_DB: own_vps
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
       - name: Prepare base system
         shell: bash
         run: |
