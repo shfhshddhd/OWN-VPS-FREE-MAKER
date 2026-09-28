@@ -222,10 +222,19 @@ jobs:
           print("B_IS_NOW_ALLOWED_TO_TAKEOVER=A")
           PY
 
+      - name: Cancel A after B takeover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "B is ACTIVE. Requesting cancellation of A run ${SOURCE_RUN}."
+          gh api --method POST -H "Accept: application/vnd.github+json" "/repos/${{ github.repository }}/actions/runs/${SOURCE_RUN}/cancel"
+          echo "A_CANCEL_REQUESTED=${SOURCE_RUN}"
+
       - name: Keep B alive
         run: |
           set -euo pipefail
           while true; do
-            echo "B ACTIVE - standby takeover complete"
+            echo "B ACTIVE - A cancellation requested"
             sleep 60
           done
