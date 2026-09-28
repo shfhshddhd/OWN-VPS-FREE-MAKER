@@ -41,9 +41,14 @@ jobs:
             sleep 10
           fi
 
-          # Controller normally starts/restarts workers itself. This remains
-          # as a last-resort recovery path if both worker and standby vanish.
-          if [ "$workers" -eq 0 ] && [ "$standbys" -eq 0 ]; then
-            echo "NO_WORKER_OR_STANDBY: starting worker"
-            gh workflow run worker.yml --repo "$REPO" --ref main
+          # The controller owns worker recovery. Do not dispatch a worker
+          # directly from the watchdog: GitHub run visibility can lag MongoDB's
+          # leader lease during handover and create duplicate workers.
+          if [ "$controllers" -gt 0 ]; then
+            echo "CONTROLLER_PRESENT: worker recovery delegated to controller"
+            exit 0
           fi
+
+          # If there was no controller, we already started one above.
+          # The new controller will inspect MongoDB before creating a worker.
+          echo "CONTROLLER_RECOVERY_ONLY"
