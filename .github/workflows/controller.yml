@@ -56,10 +56,12 @@ jobs:
           if [ -n "$active_runner" ] && [ "$heartbeat_age" != "null" ]; then
             if awk "BEGIN {exit !($heartbeat_age > 150)}"; then
               echo "STALE_ACTIVE_HEARTBEAT: $heartbeat_age seconds"
-              gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[].databaseId' |
-                xargs -r -n1 gh api -X POST "/repos/$REPO/actions/runs/{}/cancel" || true
-              gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[].databaseId' |
-                xargs -r -n1 gh api -X POST "/repos/$REPO/actions/runs/{}/cancel" || true
+              for run_id in $(gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[].databaseId'); do
+                gh api -X POST "/repos/$REPO/actions/runs/$run_id/cancel" || true
+              done
+              for run_id in $(gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[].databaseId'); do
+                gh api -X POST "/repos/$REPO/actions/runs/$run_id/cancel" || true
+              done
               sleep 5
               gh workflow run worker.yml --repo "$REPO" --ref main
               exit 0
