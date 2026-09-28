@@ -1,0 +1,150 @@
+name: OWN VPS - Hot Standby Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Current active worker run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  standby:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      REPO: ${{ github.repository }}
+      VPS_ROOT: /opt/vps-data
+      MONGO_DB: own_vps
+      SYNC_INTERVAL: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Bootstrap standby
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: bash worker/bootstrap.sh
+
+      - name: Validate secrets
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+        run: |
+          test -n "$MONGO_URI"
+          test -n "$STATE_KEY"
+
+      - name: Prepare Python runtime
+        run: |
+          python3 -m venv /opt/vps-venv
+          /opt/vps-venv/bin/pip install --disable-pip-version-check --quiet "pymongo>=4.13,<5"
+
+      - name: Restore latest checkpoint
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          sudo /opt/vps-venv/bin/python vps/mongo_sync.py restore             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+
+      - name: Start standby mirror
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          nohup sudo /opt/vps-venv/bin/python vps/mongo_sync.py mirror             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --interval "$SYNC_INTERVAL" >/tmp/mirror.log 2>&1 &
+          echo $! >/tmp/mirror.pid
+
+      - name: Standby heartbeat
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          (
+            while true; do
+              sudo /opt/vps-venv/bin/python controller/state.py heartbeat                 --uri "$MONGO_URI" --db "$MONGO_DB"                 --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"                 --role standby --status standby --lease 90 >/dev/null 2>&1 || exit 1
+              sleep 20
+            done
+          ) >/tmp/standby-heartbeat.log 2>&1 &
+          echo $! >/tmp/standby-heartbeat.pid
+
+      - name: Verify standby
+        run: |
+          set -euo pipefail
+          bash worker/health.sh
+          sudo kill -0 "$(cat /tmp/mirror.pid)"
+          sudo kill -0 "$(cat /tmp/standby-heartbeat.pid)"
+          test -d "$VPS_ROOT"
+          echo "STANDBY_READY=YES"
+
+      - name: Publish standby READY
+        uses: actions/upload-artifact@v4
+        with:
+          name: standby-ready-${{ inputs.source_run_id }}-${{ github.run_id }}
+          path: /tmp/mirror.pid
+          retention-days: 1
+          compression-level: 0
+
+      - name: Wait for cutover and verify
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          sudo /opt/vps-venv/bin/python vps/mongo_sync.py watch-cutover             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --interval "$SYNC_INTERVAL"
+
+      - name: Publish VERIFIED
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-${{ inputs.source_run_id }}-${{ github.run_id }}
+          path: /tmp/mirror.pid
+          retention-days: 1
+          compression-level: 0
+
+      - name: Acquire leadership
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          sudo /opt/vps-venv/bin/python controller/state.py acquire             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --lease 90
+
+      - name: Activate worker
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          sudo /opt/vps-venv/bin/python vps/mongo_sync.py activate             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+
+      - name: Stop standby mirror
+        run: kill "$(cat /tmp/mirror.pid)" 2>/dev/null || true
+
+      - name: Claim public relay
+        env:
+          SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
+        run: sudo -E bash relay/connect.sh
+
+      - name: Start active sync
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          nohup sudo /opt/vps-venv/bin/python vps/mongo_sync.py sync             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
+          echo $! >/tmp/mongo-sync.pid
+
+      - name: Cancel previous worker after takeover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "/repos/$REPO/actions/runs/${{ inputs.source_run_id }}/cancel"
+
+      - name: Prewarm next standby
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 60
+          gh workflow run standby.yml --repo "$REPO" --ref main             -f source_run_id="$GITHUB_RUN_ID"
+
+      - name: Active health monitor
+        run: |
+          set -euo pipefail
+          while true; do
+            bash worker/health.sh
+            bash relay/health.sh
+            sudo kill -0 "$(cat /tmp/mongo-sync.pid)"
+            sleep 30
+          done
