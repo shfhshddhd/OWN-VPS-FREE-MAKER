@@ -123,7 +123,10 @@ jobs:
           sudo systemctl is-active --quiet ssh
           test -d "$VPS_ROOT"
           for i in $(seq 1 30); do
-            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then exit 0; fi
+            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then
+              printf 'READY run=%s generation=%s time=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_NUMBER" "$(date -Is)" >/tmp/ready.txt
+              exit 0
+            fi
             sleep 2
           done
           sudo superdmz -status || true
