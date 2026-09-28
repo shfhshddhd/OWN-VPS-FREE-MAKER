@@ -33,12 +33,12 @@ jobs:
       - name: Check secrets
         env:
           SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
-          SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
           test -n "$SUPERDMZ_TOKEN"
-          test -n "$SSH_KEYS"
+          test -n "$SSH_PASSWORD"
           test -n "$MONGO_URI"
       - name: Install Mongo runtime
         run: |
@@ -64,25 +64,26 @@ jobs:
         run: |
           set -euo pipefail
           sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py restore --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
-      - name: Configure SSH
+      - name: Configure password SSH
         env:
-          SSH_KEYS: ${{ secrets.SSH_AUTHORIZED_KEYS }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
-          sudo install -d -m 700 /root/.ssh
-          printf '%s\n' "$SSH_KEYS" | sudo tee /root/.ssh/authorized_keys >/dev/null
-          sudo chmod 600 /root/.ssh/authorized_keys
+          test "${#SSH_PASSWORD}" -ge 16
+          printf 'root:%s\n' "$SSH_PASSWORD" | sudo chpasswd
           sudo install -d -m 755 /etc/ssh/sshd_config.d
           sudo tee /etc/ssh/sshd_config.d/99-own-vps.conf >/dev/null <<'EOF'
-          PermitRootLogin prohibit-password
-          PasswordAuthentication no
+          PermitRootLogin yes
+          PasswordAuthentication yes
           KbdInteractiveAuthentication no
-          PubkeyAuthentication yes
+          PubkeyAuthentication no
           ChallengeResponseAuthentication no
+          UsePAM yes
           X11Forwarding no
           AllowTcpForwarding yes
           ClientAliveInterval 60
           ClientAliveCountMax 3
+          MaxAuthTries 3
           EOF
           sudo sshd -t
           sudo systemctl restart ssh
