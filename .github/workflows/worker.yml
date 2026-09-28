@@ -1,0 +1,185 @@
+name: OWN VPS - Active Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Previous worker run ID"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: own-vps-worker-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  active:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      REPO: ${{ github.repository }}
+      VPS_ROOT: /opt/vps-data
+      MONGO_DB: own_vps
+      SYNC_INTERVAL: 15
+      ROTATE_AFTER: 285
+      RELAY_HOST: sareeffucker.dmzgate.com
+      RELAY_PORT: 16740
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Bootstrap worker
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bash worker/bootstrap.sh
+
+      - name: Validate secrets
+        env:
+          SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+          STATE_KEY: ${{ secrets.VPS_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SUPERDMZ_TOKEN"
+          test -n "$SSH_PASSWORD"
+          test -n "$MONGO_URI"
+          test -n "$STATE_KEY"
+
+      - name: Prepare Python runtime
+        run: |
+          set -euo pipefail
+          python3 -m venv /opt/vps-venv
+          /opt/vps-venv/bin/pip install --disable-pip-version-check --quiet "pymongo>=4.13,<5"
+
+      - name: Restore durable state
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          sudo /opt/vps-venv/bin/python vps/mongo_sync.py restore             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+
+      - name: Acquire active leadership
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          sudo /opt/vps-venv/bin/python controller/state.py acquire             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --lease 90
+
+      - name: Connect public relay
+        env:
+          SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
+        run: |
+          sudo -E bash relay/connect.sh
+
+      - name: Start durable active sync
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          nohup sudo /opt/vps-venv/bin/python vps/mongo_sync.py sync             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
+          echo $! >/tmp/mongo-sync.pid
+
+      - name: Start active heartbeat
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          nohup sudo /opt/vps-venv/bin/python controller/state.py heartbeat             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --role active --status active --lease 90 >/tmp/heartbeat-once.log 2>&1 &
+          echo $! >/tmp/heartbeat.pid
+
+          (
+            while true; do
+              sudo /opt/vps-venv/bin/python controller/state.py heartbeat                 --uri "$MONGO_URI" --db "$MONGO_DB"                 --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"                 --role active --status active --lease 90 >/dev/null 2>&1 || exit 1
+              sleep 20
+            done
+          ) >/tmp/heartbeat.log 2>&1 &
+          echo $! >/tmp/heartbeat-loop.pid
+
+      - name: Active readiness gate
+        run: |
+          set -euo pipefail
+          bash worker/health.sh
+          bash relay/health.sh
+          sudo kill -0 "$(cat /tmp/mongo-sync.pid)"
+          sudo kill -0 "$(cat /tmp/heartbeat-loop.pid)"
+          echo "ACTIVE_READY=YES"
+
+      - name: Prewarm hot standby
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target=$(($(date +%s) + ROTATE_AFTER*60))
+          while [ "$(date +%s)" -lt "$target" ]; do
+            bash worker/health.sh
+            sleep 30
+          done
+
+          gh workflow run standby.yml             --repo "$REPO" --ref main             -f source_run_id="$GITHUB_RUN_ID"
+
+      - name: Find standby
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            id="$(gh run list --workflow standby.yml --repo "$REPO"               --event workflow_dispatch --status in_progress --limit 20               --json databaseId,createdAt               --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"') | .databaseId' | head -n1 || true)"
+            if [ -n "$id" ]; then echo "$id" >/tmp/standby-run; exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Wait standby READY
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          id="$(cat /tmp/standby-run)"
+          for i in $(seq 1 180); do
+            n="$(gh api "/repos/$REPO/actions/artifacts?name=standby-ready-$GITHUB_RUN_ID-$id&per_page=1" --jq '.artifacts|length' 2>/dev/null || echo 0)"
+            [ "$n" -gt 0 ] && exit 0
+            sleep 10
+          done
+          echo "Standby READY timeout"
+          exit 1
+
+      - name: Final checkpoint and request cutover
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          id="$(cat /tmp/standby-run)"
+          sudo /opt/vps-venv/bin/python vps/mongo_sync.py once             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+          sudo /opt/vps-venv/bin/python vps/mongo_sync.py request-cutover             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --target-run "$id"
+
+      - name: Wait standby VERIFIED
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          id="$(cat /tmp/standby-run)"
+          for i in $(seq 1 180); do
+            n="$(gh api "/repos/$REPO/actions/artifacts?name=verified-$GITHUB_RUN_ID-$id&per_page=1" --jq '.artifacts|length' 2>/dev/null || echo 0)"
+            [ "$n" -gt 0 ] && exit 0
+            sleep 10
+          done
+          echo "Standby verification timeout; ACTIVE worker remains owner"
+          exit 1
+
+      - name: Retire active worker
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          set -euo pipefail
+          sudo /opt/vps-venv/bin/python controller/state.py release             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+          echo "OLD_WORKER_RELEASED=YES"
+
+      - name: Keep worker alive only until GitHub cancellation
+        run: |
+          while true; do
+            bash worker/health.sh
+            sleep 30
+          done
