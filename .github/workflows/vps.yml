@@ -81,7 +81,7 @@ jobs:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py restore --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py restore --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID"
       - name: Configure hardened SSH
         shell: bash
         env:
@@ -112,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.mode }}" = "handover" ]; then MODE=mirror; else MODE=sync; fi
-          nohup /opt/vps-sync-venv/bin/python vps/mongo_sync.py "$MODE" --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
+          nohup sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py "$MODE" --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
           echo $! >/tmp/mongo-sync.pid
           sleep 3
           cat /tmp/mongo-sync.log || true
@@ -188,7 +188,7 @@ jobs:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py once --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py once --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
       - name: Initial worker request cutover
         if: ${{ inputs.mode == 'initial' }}
         shell: bash
@@ -196,7 +196,7 @@ jobs:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --target-run "$(cat /tmp/target-run.txt)"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --target-run "$(cat /tmp/target-run.txt)"
       - name: Initial worker wait VERIFIED
         if: ${{ inputs.mode == 'initial' }}
         shell: bash
@@ -224,7 +224,7 @@ jobs:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py watch-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py watch-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL"
       - name: Handover publish VERIFIED
         if: ${{ inputs.mode == 'handover' }}
         uses: actions/upload-artifact@v4
@@ -240,7 +240,7 @@ jobs:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py activate --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py activate --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
       - name: Handover start active sync
         if: ${{ inputs.mode == 'handover' }}
         shell: bash
@@ -248,7 +248,7 @@ jobs:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
-          nohup /opt/vps-sync-venv/bin/python vps/mongo_sync.py sync --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
+          nohup sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py sync --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --interval "$SYNC_INTERVAL" >/tmp/mongo-sync.log 2>&1 &
           echo $! >/tmp/mongo-sync.pid
       - name: Handover cancel previous worker
         if: ${{ inputs.mode == 'handover' }}
@@ -303,8 +303,8 @@ jobs:
         run: |
           set -euo pipefail
           TARGET_RUN=$(cat /tmp/target-run.txt)
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py once --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
-          /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --target-run "$TARGET_RUN"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py once --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
+          sudo /opt/vps-sync-venv/bin/python vps/mongo_sync.py request-cutover --uri "$MONGO_URI" --db "$MONGO_DB" --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --target-run "$TARGET_RUN"
       - name: Active worker wait next VERIFIED
         shell: bash
         env:
