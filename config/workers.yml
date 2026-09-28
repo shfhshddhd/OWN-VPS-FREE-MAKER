@@ -1,0 +1,19 @@
+worker:
+  job_timeout_minutes: 355
+  rotation_after_minutes: 285
+  readiness_timeout_minutes: 30
+  verification_timeout_minutes: 30
+  heartbeat_seconds: 20
+  state_sync_seconds: 15
+  stale_after_seconds: 90
+
+relay:
+  host: sareeffucker.dmzgate.com
+  port: 16740
+  local_port: 22
+
+storage:
+  mongo_db: own_vps
+  roots:
+    - /opt/vps-data
+    - /root/.pm2
