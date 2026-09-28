@@ -1,4 +1,4 @@
-name: OWN VPS - Recovery Watchdog
+name: OWN VPS - Watchdog
 
 on:
   schedule:
@@ -11,24 +11,18 @@ permissions:
 
 jobs:
   watchdog:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check VPS workers
+      - name: Recover if control plane is empty
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        shell: bash
         run: |
           set -euo pipefail
-
-          active=$(gh run list --workflow vps.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')
-          queued=$(gh run list --workflow vps.yml --repo "$REPO" --status queued --limit 20 --json databaseId --jq 'length')
-
-          echo "in_progress=$active queued=$queued"
-
-          if [ "$active" -eq 0 ] && [ "$queued" -eq 0 ]; then
-            echo "NO VPS WORKER FOUND - STARTING RECOVERY WORKER"
-            gh workflow run vps.yml --repo "$REPO" --ref main -f mode=initial -f source_run_id=""
-          else
-            echo "VPS WORKER PRESENT - NO RECOVERY NEEDED"
+          workers="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
+          standbys="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
+          echo "workers=$workers standbys=$standbys"
+          if [ "$workers" -eq 0 ] && [ "$standbys" -eq 0 ]; then
+            gh workflow run worker.yml --repo "$REPO" --ref main
           fi
