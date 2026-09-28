@@ -1,0 +1,55 @@
+name: OWN VPS - Controller
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: own-vps-controller
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      REPO: ${{ github.repository }}
+      MONGO_DB: own_vps
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare Python
+        run: |
+          python3 -m venv /opt/controller-venv
+          /opt/controller-venv/bin/pip install --disable-pip-version-check --quiet "pymongo>=4.13,<5"
+
+      - name: Reconcile control plane
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          active="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
+          standby="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
+          echo "active_workflow_runs=$active standby_workflow_runs=$standby"
+
+          live="$(
+            /opt/controller-venv/bin/python controller/state.py active               --uri "$MONGO_URI" --db "$MONGO_DB"               --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" || true
+          )"
+          echo "mongo_active=$live"
+
+          if [ "$active" -eq 0 ] && [ "$standby" -eq 0 ]; then
+            echo "No worker present; starting recovery active worker"
+            gh workflow run worker.yml --repo "$REPO" --ref main
+            exit 0
+          fi
+
+          if [ "$standby" -eq 0 ] && [ "$active" -gt 0 ]; then
+            echo "Active exists; standby will be created by active worker"
+          fi
