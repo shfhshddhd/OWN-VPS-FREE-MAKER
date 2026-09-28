@@ -59,8 +59,10 @@ jobs:
           find_replacement_controller() {
             gh run list --workflow "$CONTROLLER_WORKFLOW" --repo "$REPO" --status in_progress \
               --limit 50 --json databaseId,createdAt \
-              --jq --argjson self "$SELF_RUN_ID" \
-                '[.[] | select(.databaseId != $self)] | sort_by(.createdAt) | last | .databaseId // empty'
+              --jq 'sort_by(.createdAt) | last | .databaseId // empty' |
+              while read -r id; do
+                [[ "$id" != "$SELF_RUN_ID" ]] && printf '%s\n' "$id"
+              done
           }
 
           is_newer_controller_alive() {
@@ -73,17 +75,20 @@ jobs:
 
           reconcile_once() {
             local status active_runs standby_runs heartbeat_age active_runner
+            local active_worker_ids
 
             status="$(/opt/controller-venv/bin/python controller/state.py status \
               --uri "$MONGO_URI" --db "$MONGO_DB" || true)"
             echo "CONTROL_PLANE=$status"
 
-            active_runs="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
-              --limit 50 --json databaseId --jq 'length')"
+            active_worker_ids="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
+              --limit 50 --json databaseId --jq '.[].databaseId')"
+            active_runs="$(printf '%s\n' "$active_worker_ids" | sed '/^$/d' | wc -l)"
             standby_runs="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress \
               --limit 50 --json databaseId --jq 'length')"
 
             echo "active_workflow_runs=$active_runs standby_workflow_runs=$standby_runs"
+            echo "active_worker_ids=$active_worker_ids"
 
             heartbeat_age="$(printf '%s' "$status" | jq -r '.heartbeat_age // 999999')"
             active_runner="$(printf '%s' "$status" | jq -r '.active_runner // empty')"
@@ -94,23 +99,32 @@ jobs:
               return
             fi
 
+            # MongoDB can retain the previous active_runner while a newly
+            # dispatched worker is still bootstrapping. Never cancel a new
+            # worker just because the old runner heartbeat is stale.
+            # A stale worker is recoverable only when the Mongo active_runner
+            # is still an in-progress GitHub worker run.
             if [ -n "$active_runner" ] && [ "$heartbeat_age" != "null" ]; then
               if awk "BEGIN {exit !($heartbeat_age > 150)}"; then
-                echo "STALE_ACTIVE_HEARTBEAT: $heartbeat_age seconds"
+                if printf '%s\n' "$active_worker_ids" | grep -Fxq "$active_runner"; then
+                  echo "STALE_ACTIVE_HEARTBEAT: runner=$active_runner age=${heartbeat_age}s"
 
-                for run_id in $(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
-                  --limit 50 --json databaseId --jq '.[].databaseId'); do
-                  cancel_run "$run_id"
-                done
+                  cancel_run "$active_runner"
+                  sleep 10
 
-                for run_id in $(gh run list --workflow standby.yml --repo "$REPO" --status in_progress \
-                  --limit 50 --json databaseId --jq '.[].databaseId'); do
-                  cancel_run "$run_id"
-                done
+                  remaining_workers="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
+                    --limit 50 --json databaseId --jq 'length')"
 
-                sleep 5
-                gh workflow run worker.yml --repo "$REPO" --ref main
-                return
+                  if [ "$remaining_workers" -eq 0 ]; then
+                    echo "STALE_WORKER_REMOVED: starting recovery worker"
+                    gh workflow run worker.yml --repo "$REPO" --ref main
+                  else
+                    echo "NEW_WORKER_ALREADY_RUNNING: leaving it untouched"
+                  fi
+                  return
+                else
+                  echo "STALE_METADATA_ONLY: active_runner=$active_runner is not an in-progress worker; waiting for current worker"
+                fi
               fi
             fi
 
