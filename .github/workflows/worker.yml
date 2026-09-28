@@ -74,7 +74,7 @@ jobs:
         env:
           SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
         run: |
-          sudo -E bash relay/connect.sh
+          sudo env SUPERDMZ_TOKEN="$SUPERDMZ_TOKEN" bash relay/connect.sh
 
       - name: Start durable active sync
         env:
