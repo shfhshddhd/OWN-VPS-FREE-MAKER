@@ -74,7 +74,7 @@ jobs:
           }
 
           reconcile_once() {
-            local status active_runs standby_runs heartbeat_age active_runner
+            local status active_runs standby_runs heartbeat_age active_runner leader_runner leader_lease_active leader_lease_remaining
             local active_worker_ids
 
             status="$(/opt/controller-venv/bin/python controller/state.py status \
@@ -92,9 +92,20 @@ jobs:
 
             heartbeat_age="$(printf '%s' "$status" | jq -r '.heartbeat_age // 999999')"
             active_runner="$(printf '%s' "$status" | jq -r '.active_runner // empty')"
+            leader_runner="$(printf '%s' "$status" | jq -r '.leader_runner // empty')"
+            leader_lease_active="$(printf '%s' "$status" | jq -r '.leader_lease_active // false')"
+            leader_lease_remaining="$(printf '%s' "$status" | jq -r '.leader_lease_remaining // 0')"
 
             if [ "$active_runs" -eq 0 ] && [ "$standby_runs" -eq 0 ]; then
-              echo "NO_WORKER: starting recovery"
+              # GitHub Actions visibility can briefly show zero workers while
+              # a worker is being cancelled or a replacement is booting.
+              # MongoDB's leader lease is authoritative during that window.
+              if [ "$leader_lease_active" = "true" ]; then
+                echo "LEADER_LEASE_ACTIVE: leader=$leader_runner remaining=${leader_lease_remaining}s; waiting"
+                return
+              fi
+
+              echo "NO_WORKER_NO_ACTIVE_LEASE: starting recovery"
               gh workflow run worker.yml --repo "$REPO" --ref main
               return
             fi
