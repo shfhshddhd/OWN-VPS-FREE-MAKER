@@ -117,17 +117,19 @@ jobs:
           test -d "$VPS_ROOT"
           sudo ss -lntp | grep ':22 '
 
-          for i in $(seq 1 30); do
-            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then
-              echo "B_PUBLIC_TCP=REACHABLE"
-              break
-            fi
-            if [ "$i" -eq 30 ]; then
-              sudo superdmz -status || true
-              exit 1
-            fi
-            sleep 2
-          done
+          status_output="$(sudo superdmz -status 2>&1 || true)"
+          printf '%s\\n' "$status_output"
+          if printf '%s\\n' "$status_output" | grep -qi 'ONLINE'; then
+            echo "B_PUBLIC_TUNNEL=ONLINE"
+          else
+            echo "B_PUBLIC_TUNNEL=NOT_ONLINE"
+            exit 1
+          fi
+
+          test -s /tmp/mongo-mirror.pid
+          mirror_pid="$(cat /tmp/mongo-mirror.pid)"
+          sudo kill -0 "$mirror_pid"
+          echo "B_MONGO_MIRROR=ALIVE"
 
           export MONGO_URI
           python3 - <<'PY'
