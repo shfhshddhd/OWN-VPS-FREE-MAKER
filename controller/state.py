@@ -1,46 +1,103 @@
 #!/usr/bin/env python3
-import argparse, os, sys, time
+import argparse
+import json
+import os
+import time
 from pymongo import MongoClient, ReturnDocument
 
-def db(uri,name):
-    c=MongoClient(uri,serverSelectionTimeoutMS=10000,retryWrites=True)
-    c.admin.command("ping")
-    return c,c[name]
+def open_db(uri, name):
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000, retryWrites=True)
+    client.admin.command("ping")
+    return client, client[name]
 
 def main():
-    p=argparse.ArgumentParser()
-    p.add_argument("command",choices=["acquire","heartbeat","release","active"])
-    p.add_argument("--uri",required=True); p.add_argument("--db",default="own_vps")
-    p.add_argument("--runner-id",default=os.getenv("GITHUB_RUN_ID","unknown"))
-    p.add_argument("--generation",default=os.getenv("GITHUB_RUN_NUMBER","0"))
-    p.add_argument("--role",default="worker"); p.add_argument("--status",default="ready")
-    p.add_argument("--lease",type=int,default=90); p.add_argument("--interval",type=int,default=20)
-    a=p.parse_args()
-    c,d=db(a.uri,a.db); now=time.time()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", choices=["acquire","heartbeat","release","active","status"])
+    ap.add_argument("--uri", required=True)
+    ap.add_argument("--db", default="own_vps")
+    ap.add_argument("--runner-id", default=os.getenv("GITHUB_RUN_ID","unknown"))
+    ap.add_argument("--generation", default=os.getenv("GITHUB_RUN_NUMBER","0"))
+    ap.add_argument("--role", default="worker")
+    ap.add_argument("--status", default="ready")
+    ap.add_argument("--lease", type=int, default=90)
+    ap.add_argument("--interval", type=int, default=20)
+    a = ap.parse_args()
+    client, db = open_db(a.uri, a.db)
+    now = time.time()
     try:
-        if a.command=="acquire":
-            doc=d.vps_leader.find_one_and_update(
-                {"_id":"current","$or":[{"lease_until":{"$lt":now}},{"runner_id":str(a.runner_id)}]},
-                {"$set":{"runner_id":str(a.runner_id),"generation":str(a.generation),
-                         "lease_until":now+a.lease,"updated_at":now}},
-                upsert=True,return_document=ReturnDocument.AFTER)
-            if not doc or str(doc["runner_id"])!=str(a.runner_id):
+        if a.command == "acquire":
+            try:
+                doc = db.vps_leader.find_one_and_update(
+                    {"_id":"current",
+                     "$or":[{"lease_until":{"$lt":now}},{"runner_id":str(a.runner_id)}]},
+                    {"$set":{"runner_id":str(a.runner_id),
+                             "generation":str(a.generation),
+                             "lease_until":now+a.lease,
+                             "updated_at":now}},
+                    upsert=True,
+                    return_document=ReturnDocument.AFTER,
+                )
+            except Exception:
+                doc = None
+            if not doc or str(doc.get("runner_id")) != str(a.runner_id):
                 raise SystemExit("LEADER_LOCK_NOT_ACQUIRED")
-            print("LEADER_LOCK_ACQUIRED"); return 0
-        if a.command=="heartbeat":
-            d.vps_runners.update_one({"_id":str(a.runner_id)},{"$set":{
-                "runner_id":str(a.runner_id),"generation":str(a.generation),
-                "role":a.role,"status":a.status,"heartbeat":time.time()}},upsert=True)
-            if a.role=="active":
-                d.vps_leader.update_one({"_id":"current","runner_id":str(a.runner_id)},
-                    {"$set":{"generation":str(a.generation),"lease_until":time.time()+a.lease,
-                             "updated_at":time.time()}},upsert=False)
-            print("HEARTBEAT_OK"); return 0
-        if a.command=="release":
-            d.vps_leader.delete_one({"_id":"current","runner_id":str(a.runner_id)})
-            print("LEADER_RELEASED"); return 0
-        doc=d.vps_meta.find_one({"_id":"live"}) or {}
-        print(doc.get("active_runner","")); return 0
-    finally: c.close()
+            print("LEADER_LOCK_ACQUIRED")
+            return 0
 
-if __name__=="__main__": raise SystemExit(main())
+        if a.command == "heartbeat":
+            ts = time.time()
+            db.vps_runners.update_one(
+                {"_id":str(a.runner_id)},
+                {"$set":{"runner_id":str(a.runner_id),
+                         "generation":str(a.generation),
+                         "role":a.role,
+                         "status":a.status,
+                         "heartbeat":ts}},
+                upsert=True,
+            )
+            if a.role == "active":
+                leader = db.vps_leader.update_one(
+                    {"_id":"current","runner_id":str(a.runner_id)},
+                    {"$set":{"generation":str(a.generation),
+                             "lease_until":ts+a.lease,
+                             "updated_at":ts}},
+                )
+                if leader.matched_count != 1:
+                    raise SystemExit("LEADER_LEASE_LOST")
+            print("HEARTBEAT_OK")
+            return 0
+
+        if a.command == "release":
+            db.vps_leader.delete_one({"_id":"current","runner_id":str(a.runner_id)})
+            db.vps_runners.update_one(
+                {"_id":str(a.runner_id)},
+                {"$set":{"status":"retiring","retired_at":time.time()}},
+            )
+            print("LEADER_RELEASED")
+            return 0
+
+        if a.command == "active":
+            doc = db.vps_meta.find_one({"_id":"live"}) or {}
+            print(doc.get("active_runner",""))
+            return 0
+
+        live = db.vps_meta.find_one({"_id":"live"}) or {}
+        runner_id = str(live.get("active_runner",""))
+        runner = db.vps_runners.find_one({"_id":runner_id}) or {}
+        leader = db.vps_leader.find_one({"_id":"current"}) or {}
+        hb = runner.get("heartbeat")
+        print(json.dumps({
+            "active_runner":runner_id,
+            "generation":str(live.get("generation","")),
+            "status":runner.get("status",""),
+            "heartbeat":hb,
+            "heartbeat_age":(time.time()-hb) if hb else None,
+            "leader_runner":str(leader.get("runner_id","")),
+            "leader_lease_until":leader.get("lease_until"),
+        }, separators=(",",":")))
+        return 0
+    finally:
+        client.close()
+
+if __name__ == "__main__":
+    raise SystemExit(main())
