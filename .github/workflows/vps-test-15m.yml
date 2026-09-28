@@ -99,15 +99,17 @@ jobs:
           sudo systemctl is-active --quiet ssh
           test -d "$VPS_ROOT"
           sudo ss -lntp | grep ':22 '
-          for i in $(seq 1 30); do
-            if timeout 5 bash -c "cat </dev/null >/dev/tcp/$SUPERDMZ_HOST/$SUPERDMZ_PORT" 2>/dev/null; then
-              echo "A_PUBLIC_TCP=READY"
-              exit 0
-            fi
-            sleep 2
-          done
-          sudo superdmz -status || true
-          exit 1
+          # Do not require the runner to connect back through the public
+          # SuperDMZ endpoint. The tunnel can be ONLINE while the provider
+          # blocks/doesn't route this self-originated TCP check.
+          if sudo superdmz -status 2>&1 | grep -qiE 'status:[[:space:]]*online|online'; then
+            echo "A_PUBLIC_TUNNEL=ONLINE"
+          else
+            echo "A_PUBLIC_TUNNEL=NOT_ONLINE"
+            sudo superdmz -status || true
+            exit 1
+          fi
+          echo "A_READINESS=PASS"
       - name: A baseline checkpoint
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
