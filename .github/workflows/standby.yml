@@ -105,6 +105,14 @@ jobs:
         run: |
           sudo /opt/vps-venv/bin/python controller/state.py acquire             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" --lease 90
 
+      - name: Switch standby heartbeat to active
+        run: |
+          set -euo pipefail
+          if [ -f /tmp/standby-heartbeat.pid ]; then
+            kill "$(cat /tmp/standby-heartbeat.pid)" 2>/dev/null || true
+          fi
+          rm -f /tmp/standby-heartbeat.pid
+
       - name: Activate worker
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
@@ -118,6 +126,21 @@ jobs:
         env:
           SUPERDMZ_TOKEN: ${{ secrets.SUPERDMZ_TOKEN }}
         run: sudo env SUPERDMZ_TOKEN="$SUPERDMZ_TOKEN" bash relay/connect.sh
+
+      - name: Start active heartbeat
+        env:
+          MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
+        run: |
+          (
+            while true; do
+              sudo /opt/vps-venv/bin/python controller/state.py heartbeat \
+                --uri "$MONGO_URI" --db "$MONGO_DB" \
+                --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER" \
+                --role active --status active --lease 90 >/dev/null 2>&1 || exit 1
+              sleep 20
+            done
+          ) >/tmp/active-heartbeat.log 2>&1 &
+          echo $! >/tmp/active-heartbeat.pid
 
       - name: Start active sync
         env:
@@ -146,5 +169,6 @@ jobs:
             bash worker/health.sh
             bash relay/health.sh
             sudo kill -0 "$(cat /tmp/mongo-sync.pid)"
+            sudo kill -0 "$(cat /tmp/active-heartbeat.pid)"
             sleep 30
           done
