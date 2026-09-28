@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import time
+import shutil
 from pathlib import Path
 
 from pymongo import MongoClient
@@ -17,6 +18,7 @@ DEFAULT_PATHS = [
 ]
 
 EXCLUDE_DIRS = {"/proc", "/sys", "/dev", "/run", "/tmp", "/var/lib/apt/lists"}
+DOCKER_BACKUP_ROOT = Path("/opt/vps-data/.docker-volumes")
 
 
 def sha256_file(path):
@@ -54,6 +56,88 @@ def safe_files(roots):
                         yield path
                 except OSError:
                     continue
+
+
+def docker_volume_names():
+    try:
+        out = subprocess.check_output(
+            ["docker", "volume", "ls", "-q"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return [x.strip() for x in out.splitlines() if x.strip()]
+    except Exception:
+        return []
+
+
+def snapshot_docker_volumes():
+    """Copy Docker named-volume data into the managed durable tree."""
+    try:
+        DOCKER_BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+
+    count = 0
+    for name in docker_volume_names():
+        try:
+            inspect = subprocess.check_output(
+                ["docker", "volume", "inspect", name],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            import json
+            mountpoint = json.loads(inspect)[0]["Mountpoint"]
+            source = Path(mountpoint) / "_data"
+            target = DOCKER_BACKUP_ROOT / name
+            if source.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["rsync", "-aHAX", "--delete", str(source) + "/", str(target) + "/"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
+def restore_docker_volumes():
+    """Recreate Docker named volumes from the durable backup tree."""
+    if not DOCKER_BACKUP_ROOT.is_dir():
+        return 0
+
+    restored = 0
+    for source in DOCKER_BACKUP_ROOT.iterdir():
+        if not source.is_dir():
+            continue
+        name = source.name
+        try:
+            subprocess.run(
+                ["docker", "volume", "create", name],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            inspect = subprocess.check_output(
+                ["docker", "volume", "inspect", name],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            import json
+            mountpoint = Path(json.loads(inspect)[0]["Mountpoint"]) / "_data"
+            mountpoint.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["rsync", "-aHAX", str(source) + "/", str(mountpoint) + "/"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            restored += 1
+        except Exception:
+            continue
+    return restored
 
 
 def package_manifest():
@@ -142,6 +226,7 @@ def upload_if_changed(fs, files, path, runner_id, generation):
 
 
 def sync_once(db, fs, roots, runner_id, generation):
+    snapshot_docker_volumes()
     files = db.vps_files
     current = set()
     uploaded = 0
@@ -203,7 +288,8 @@ def restore(db, fs, roots):
             pass
         restored += 1
 
-    return restored
+    docker_restored = restore_docker_volumes()
+    return restored, docker_restored
 
 
 def verify_state(db, roots):
@@ -241,7 +327,7 @@ def main():
 
     try:
         if args.mode == "restore":
-            n = restore(db, fs, roots)
+            n, docker_n = restore(db, fs, roots)
             db.vps_meta.update_one(
                 {"_id": "live"},
                 {"$set": {
@@ -258,11 +344,12 @@ def main():
                     "generation": str(args.generation),
                     "status": "restored",
                     "restored_files": n,
+                    "restored_docker_volumes": docker_n,
                 }},
                 upsert=True,
             )
             event(db, "restore_completed", args.runner_id, args.generation, restored_files=n)
-            print(f"RESTORED_FILES={n}", flush=True)
+            print(f"RESTORED_FILES={n} RESTORED_DOCKER_VOLUMES={docker_n}", flush=True)
             return 0
 
         if args.mode == "request-cutover":
@@ -296,7 +383,7 @@ def main():
                     and str(doc.get("target_run")) == str(args.runner_id)
                     and doc.get("status") == "requested"
                 ):
-                    restored = restore(db, fs, roots)
+                    restored, docker_restored = restore(db, fs, roots)
                     bad = verify_state(db, roots)
 
                     if bad:
@@ -323,6 +410,7 @@ def main():
                             "status": "verified",
                             "verified_at": time.time(),
                             "restored_files": restored,
+                            "restored_docker_volumes": docker_restored,
                         }},
                         upsert=True,
                     )
@@ -337,6 +425,7 @@ def main():
                         db, "cutover_verified",
                         args.runner_id, args.generation,
                         restored_files=restored,
+                        restored_docker_volumes=docker_restored,
                     )
                     print(f"CUTOVER_VERIFIED restored={restored}", flush=True)
                     return 0
@@ -408,6 +497,7 @@ def main():
                         "last_mirror": time.time(),
                         "status": "standby",
                         "restored_files": n,
+                        "restored_docker_volumes": docker_n,
                     }},
                     upsert=True,
                 )
