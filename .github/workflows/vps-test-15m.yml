@@ -99,10 +99,8 @@ jobs:
           sudo systemctl is-active --quiet ssh
           test -d "$VPS_ROOT"
           sudo ss -lntp | grep ':22 '
-          # GitHub log output from SuperDMZ contains ANSI formatting codes,
-          # so parse a cleaned copy instead of grepping the raw terminal output.
           status_output="$(sudo superdmz -status 2>&1 || true)"
-          printf '%s\\n' "$status_output"
+          printf '%s\n' "$status_output"
           clean_status="$(printf '%s' "$status_output" | sed 
       - name: A baseline checkpoint
         env:
@@ -197,14 +195,12 @@ jobs:
           PY
           exit 0
 s/\\033\\[[0-9;]*[[:alpha:]]//g')"
-          if printf '%s\\n' "$clean_status" | grep -qiE 'status:[[:space:]]*ONLINE'; then
+          if printf '%s\n' "$clean_status" | grep -qiE 'Status:[[:space:]]*ONLINE'; then
             echo "A_PUBLIC_TUNNEL=ONLINE"
           else
             echo "A_PUBLIC_TUNNEL=NOT_ONLINE"
             exit 1
           fi
-          # The Mongo sync process must also still be alive before A is
-          # allowed to enter the 15-minute handover test.
           test -s /tmp/mongo-sync.pid
           sync_pid="$(cat /tmp/mongo-sync.pid)"
           sudo kill -0 "$sync_pid"
