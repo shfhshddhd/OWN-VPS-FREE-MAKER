@@ -31,11 +31,21 @@ sudo apt-get update -y
 
 packages=(
   openssh-server curl jq git rsync ca-certificates python3-venv
-  netcat-openbsd docker.io
+  netcat-openbsd
 )
 
 log "Installing base packages"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+
+# GitHub-hosted Ubuntu images normally already contain Docker. Installing
+# Ubuntu docker.io on top of an existing Docker/containerd stack can create
+# package conflicts, so only install it when Docker is genuinely absent.
+if command -v docker >/dev/null 2>&1; then
+  log "Docker already present: $(docker --version 2>/dev/null || true)"
+else
+  log "Docker missing; installing docker.io separately"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io
+fi
 
 # docker-compose-v2 is useful but must not make the whole VPS fail if the
 # Ubuntu image/repository does not currently expose that package.
