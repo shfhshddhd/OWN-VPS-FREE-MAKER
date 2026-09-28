@@ -86,6 +86,10 @@ def main():
         runner = db.vps_runners.find_one({"_id":runner_id}) or {}
         leader = db.vps_leader.find_one({"_id":"current"}) or {}
         hb = runner.get("heartbeat")
+        lease_until = leader.get("lease_until")
+        lease_remaining = max(0.0, float(lease_until) - time.time()) if lease_until else 0.0
+        leader_lease_active = bool(lease_until and float(lease_until) > time.time())
+
         print(json.dumps({
             "active_runner":runner_id,
             "generation":str(live.get("generation","")),
@@ -93,7 +97,9 @@ def main():
             "heartbeat":hb,
             "heartbeat_age":(time.time()-hb) if hb else None,
             "leader_runner":str(leader.get("runner_id","")),
-            "leader_lease_until":leader.get("lease_until"),
+            "leader_lease_until":lease_until,
+            "leader_lease_active":leader_lease_active,
+            "leader_lease_remaining":lease_remaining,
         }, separators=(",",":")))
         return 0
     finally:
