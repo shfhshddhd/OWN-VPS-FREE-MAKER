@@ -13,7 +13,6 @@ import gridfs
 DEFAULT_PATHS = [
     "/opt/vps-data",
     "/root/.pm2",
-    "/root/.ssh/authorized_keys",
     "/etc/ssh/sshd_config.d/99-own-vps.conf",
 ]
 
