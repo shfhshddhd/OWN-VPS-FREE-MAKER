@@ -2,24 +2,27 @@ name: OWN VPS - Controller
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
 
 permissions:
   actions: write
   contents: read
 
+# IMPORTANT:
+# Do not use one shared concurrency group here.
+# The old controller and replacement controller must overlap during handover.
 concurrency:
-  group: own-vps-controller
-  cancel-in-progress: true
+  group: own-vps-controller-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   reconcile:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 350
     env:
       REPO: ${{ github.repository }}
       MONGO_DB: own_vps
+      CONTROLLER_ROTATE_MINUTES: 330
+      LOOP_SECONDS: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -29,43 +32,133 @@ jobs:
           python3 -m venv /opt/controller-venv
           /opt/controller-venv/bin/pip install --disable-pip-version-check --quiet "pymongo>=4.13,<5"
 
-      - name: Reconcile control plane
+      - name: Continuous control-plane controller
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          status="$(/opt/controller-venv/bin/python controller/state.py status             --uri "$MONGO_URI" --db "$MONGO_DB" || true)"
-          echo "CONTROL_PLANE=$status"
+          SELF_RUN_ID="$GITHUB_RUN_ID"
+          CONTROLLER_WORKFLOW="controller.yml"
+          STARTED_AT="$(date -u +%s)"
+          ROTATED=false
 
-          active_runs="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
-          standby_runs="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
+          cancel_run() {
+            local run_id="$1"
+            [[ "$run_id" =~ ^[0-9]+$ ]] || return 0
+            gh api --method POST -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/runs/$run_id/cancel" >/dev/null 2>&1 || true
+          }
 
-          echo "active_workflow_runs=$active_runs standby_workflow_runs=$standby_runs"
+          dispatch_replacement_controller() {
+            echo "CONTROLLER_ROTATION: dispatching replacement controller"
+            gh workflow run "$CONTROLLER_WORKFLOW" --repo "$REPO" --ref main
+          }
 
-          heartbeat_age="$(printf '%s' "$status" | jq -r '.heartbeat_age // 999999')"
-          active_runner="$(printf '%s' "$status" | jq -r '.active_runner // empty')"
+          find_replacement_controller() {
+            gh run list --workflow "$CONTROLLER_WORKFLOW" --repo "$REPO" --status in_progress \
+              --limit 50 --json databaseId,createdAt \
+              --jq --argjson self "$SELF_RUN_ID" \
+                '[.[] | select(.databaseId != $self)] | sort_by(.createdAt) | last | .databaseId // empty'
+          }
 
-          if [ "$active_runs" -eq 0 ] && [ "$standby_runs" -eq 0 ]; then
-            echo "NO_WORKER: starting recovery"
-            gh workflow run worker.yml --repo "$REPO" --ref main
-            exit 0
-          fi
+          is_newer_controller_alive() {
+            local id="$1"
+            [[ "$id" =~ ^[0-9]+$ ]] || return 1
+            local status
+            status="$(gh run view "$id" --repo "$REPO" --json status --jq '.status' 2>/dev/null || true)"
+            [[ "$status" == "in_progress" || "$status" == "queued" || "$status" == "waiting" || "$status" == "pending" ]]
+          }
 
-          if [ -n "$active_runner" ] && [ "$heartbeat_age" != "null" ]; then
-            if awk "BEGIN {exit !($heartbeat_age > 150)}"; then
-              echo "STALE_ACTIVE_HEARTBEAT: $heartbeat_age seconds"
-              for run_id in $(gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[].databaseId'); do
-                gh api -X POST "/repos/$REPO/actions/runs/$run_id/cancel" || true
-              done
-              for run_id in $(gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq '.[].databaseId'); do
-                gh api -X POST "/repos/$REPO/actions/runs/$run_id/cancel" || true
-              done
-              sleep 5
+          reconcile_once() {
+            local status active_runs standby_runs heartbeat_age active_runner
+
+            status="$(/opt/controller-venv/bin/python controller/state.py status \
+              --uri "$MONGO_URI" --db "$MONGO_DB" || true)"
+            echo "CONTROL_PLANE=$status"
+
+            active_runs="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
+              --limit 50 --json databaseId --jq 'length')"
+            standby_runs="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress \
+              --limit 50 --json databaseId --jq 'length')"
+
+            echo "active_workflow_runs=$active_runs standby_workflow_runs=$standby_runs"
+
+            heartbeat_age="$(printf '%s' "$status" | jq -r '.heartbeat_age // 999999')"
+            active_runner="$(printf '%s' "$status" | jq -r '.active_runner // empty')"
+
+            if [ "$active_runs" -eq 0 ] && [ "$standby_runs" -eq 0 ]; then
+              echo "NO_WORKER: starting recovery"
               gh workflow run worker.yml --repo "$REPO" --ref main
+              return
+            fi
+
+            if [ -n "$active_runner" ] && [ "$heartbeat_age" != "null" ]; then
+              if awk "BEGIN {exit !($heartbeat_age > 150)}"; then
+                echo "STALE_ACTIVE_HEARTBEAT: $heartbeat_age seconds"
+
+                for run_id in $(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
+                  --limit 50 --json databaseId --jq '.[].databaseId'); do
+                  cancel_run "$run_id"
+                done
+
+                for run_id in $(gh run list --workflow standby.yml --repo "$REPO" --status in_progress \
+                  --limit 50 --json databaseId --jq '.[].databaseId'); do
+                  cancel_run "$run_id"
+                done
+
+                sleep 5
+                gh workflow run worker.yml --repo "$REPO" --ref main
+                return
+              fi
+            fi
+
+            echo "CONTROL_PLANE_HEALTHY"
+          }
+
+          echo "CONTROLLER_STARTED run=$SELF_RUN_ID"
+
+          while true; do
+            now="$(date -u +%s)"
+            age_minutes=$(( (now - STARTED_AT) / 60 ))
+
+            # Before the GitHub-hosted 6-hour job limit, create the next
+            # controller first, wait until it is actually alive, then cancel self.
+            if [[ "$ROTATED" == "false" && "$age_minutes" -ge "$CONTROLLER_ROTATE_MINUTES" ]]; then
+              ROTATED=true
+              dispatch_replacement_controller
+
+              replacement=""
+              for attempt in $(seq 1 120); do
+                replacement="$(find_replacement_controller || true)"
+                if [[ "$replacement" =~ ^[0-9]+$ ]] && is_newer_controller_alive "$replacement"; then
+                  echo "CONTROLLER_REPLACEMENT_READY run=$replacement"
+                  break
+                fi
+                replacement=""
+                sleep 5
+              done
+
+              if [[ "$replacement" =~ ^[0-9]+$ ]]; then
+                echo "CONTROLLER_HANDOVER: new=$replacement old=$SELF_RUN_ID"
+                cancel_run "$SELF_RUN_ID"
+                exit 0
+              fi
+
+              echo "CONTROLLER_HANDOVER_FAILED: replacement did not become active; continuing old controller"
+              ROTATED=false
+            fi
+
+            # If another controller has already replaced us, never compete
+            # with it. The newest live controller is authoritative.
+            newest="$(find_replacement_controller || true)"
+            if [[ "$newest" =~ ^[0-9]+$ ]] && is_newer_controller_alive "$newest"; then
+              echo "NEWER_CONTROLLER_DETECTED new=$newest old=$SELF_RUN_ID"
+              cancel_run "$SELF_RUN_ID"
               exit 0
             fi
-          fi
 
-          echo "CONTROL_PLANE_HEALTHY"
+            reconcile_once
+            sleep "$LOOP_SECONDS"
+          done
