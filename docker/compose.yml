@@ -1,0 +1,5 @@
+services:
+  placeholder:
+    image: alpine:3.22
+    command: ["sh","-c","sleep infinity"]
+    restart: unless-stopped
