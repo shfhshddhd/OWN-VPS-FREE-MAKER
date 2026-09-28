@@ -14,15 +14,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Recover if control plane is empty
+      - name: Recover controller and worker if missing
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          workers="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
-          standbys="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')"
-          echo "workers=$workers standbys=$standbys"
+
+          controllers="$(gh run list --workflow controller.yml --repo "$REPO" --status in_progress \
+            --limit 50 --json databaseId --jq 'length')"
+
+          workers="$(gh run list --workflow worker.yml --repo "$REPO" --status in_progress \
+            --limit 50 --json databaseId --jq 'length')"
+
+          standbys="$(gh run list --workflow standby.yml --repo "$REPO" --status in_progress \
+            --limit 50 --json databaseId --jq 'length')"
+
+          echo "controllers=$controllers workers=$workers standbys=$standbys"
+
+          # Controller is the always-on control plane. If a controller is
+          # missing, start one immediately. The controller itself performs
+          # A->B-style self-handover before the GitHub runner limit.
+          if [ "$controllers" -eq 0 ]; then
+            echo "NO_CONTROLLER: starting controller"
+            gh workflow run controller.yml --repo "$REPO" --ref main
+            sleep 10
+          fi
+
+          # Controller normally starts/restarts workers itself. This remains
+          # as a last-resort recovery path if both worker and standby vanish.
           if [ "$workers" -eq 0 ] && [ "$standbys" -eq 0 ]; then
+            echo "NO_WORKER_OR_STANDBY: starting worker"
             gh workflow run worker.yml --repo "$REPO" --ref main
           fi
