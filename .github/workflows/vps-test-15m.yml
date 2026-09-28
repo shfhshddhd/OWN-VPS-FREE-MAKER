@@ -95,19 +95,23 @@ jobs:
           echo $! >/tmp/mongo-sync.pid
       - name: A readiness gate
         run: |
-                  status_output="$(sudo superdmz -status 2>&1 || true)"
-                    printf '%s\n' "$status_output"
-                    if printf '%s\n' "$status_output" | grep -qi 'ONLINE'; then
-                      echo "A_PUBLIC_TUNNEL=ONLINE"
-                    else
-                      echo "A_PUBLIC_TUNNEL=NOT_ONLINE"
-                      exit 1
-                    fi
-                    test -s /tmp/mongo-sync.pid
-                    sync_pid="$(cat /tmp/mongo-sync.pid)"
-                    sudo kill -0 "$sync_pid"
-                    echo "A_MONGO_SYNC=ALIVE"
-                    echo "A_READINESS=PASS"
+          set -euo pipefail
+          sudo systemctl is-active --quiet ssh
+          test -d "$VPS_ROOT"
+          sudo ss -lntp | grep ':22 '
+          status_output="$(sudo superdmz -status 2>&1 || true)"
+          printf '%s\n' "$status_output"
+          if printf '%s\n' "$status_output" | grep -qi 'ONLINE'; then
+            echo "A_PUBLIC_TUNNEL=ONLINE"
+          else
+            echo "A_PUBLIC_TUNNEL=NOT_ONLINE"
+            exit 1
+          fi
+          test -s /tmp/mongo-sync.pid
+          sync_pid="$(cat /tmp/mongo-sync.pid)"
+          sudo kill -0 "$sync_pid"
+          echo "A_MONGO_SYNC=ALIVE"
+          echo "A_READINESS=PASS"
       - name: A baseline checkpoint
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
