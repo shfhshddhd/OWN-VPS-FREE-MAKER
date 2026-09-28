@@ -488,7 +488,7 @@ def main():
         if args.mode == "mirror":
             event(db, "worker_standby_started", args.runner_id, args.generation)
             while True:
-                n = restore(db, fs, roots)
+                n, docker_n = restore(db, fs, roots)
                 db.vps_runners.update_one(
                     {"_id": str(args.runner_id)},
                     {"$set": {
@@ -501,7 +501,10 @@ def main():
                     }},
                     upsert=True,
                 )
-                print(f"MIRROR restored={n}", flush=True)
+                print(
+                    f"MIRROR restored={n} docker_volumes={docker_n}",
+                    flush=True,
+                )
                 time.sleep(args.interval)
 
         event(db, "worker_sync_started", args.runner_id, args.generation)
