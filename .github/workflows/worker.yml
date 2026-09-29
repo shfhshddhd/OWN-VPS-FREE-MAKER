@@ -37,39 +37,34 @@ jobs:
           set -euo pipefail
           date +%s > /tmp/worker-start-epoch
 
-      - name: Launch hot standby immediately
+      - name: Start control plane and hot standby immediately
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          dispatch_epoch=$(date +%s)
-          echo "$dispatch_epoch" > /tmp/standby-dispatch-epoch
-
-          if ! gh workflow enable standby.yml --repo "$REPO"; then
-            echo "WARNING: could not enable standby.yml; retrying via REST API"
-            gh api --method PUT \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "/repos/$REPO/actions/workflows/standby.yml/enable"
-          fi
-
-          dispatched=false
-          for attempt in 1 2 3 4 5; do
-            if gh workflow run standby.yml \
-              --repo "$REPO" --ref main \
-              -f source_run_id="$GITHUB_RUN_ID"; then
-              dispatched=true
-              break
+          enable_workflow() {
+            local wf="$1"
+            if gh workflow enable "$wf" --repo "$REPO"; then return 0; fi
+            gh api --method PUT -H "Accept: application/vnd.github+json"               -H "X-GitHub-Api-Version: 2026-03-10"               "/repos/$REPO/actions/workflows/$wf/enable"
+          }
+          dispatch_if_missing() {
+            local wf="$1"
+            if [ "$(gh run list --workflow "$wf" --repo "$REPO" --status in_progress --limit 20 --json databaseId --jq 'length')" -eq 0 ]; then
+              gh workflow run "$wf" --repo "$REPO" --ref main
             fi
-            echo "Standby dispatch attempt $attempt failed; retrying..."
+          }
+          enable_workflow controller.yml
+          enable_workflow standby.yml
+          enable_workflow watchdog.yml
+          dispatch_if_missing controller.yml
+          dispatch_epoch="$(date +%s)"
+          echo "$dispatch_epoch" > /tmp/standby-dispatch-epoch
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run standby.yml --repo "$REPO" --ref main -f source_run_id="$GITHUB_RUN_ID"; then exit 0; fi
             sleep $((attempt * 5))
           done
-
-          if [ "$dispatched" != "true" ]; then
-            echo "::error::Unable to dispatch standby.yml after 5 attempts"
-            exit 1
-          fi
-
+          echo "::error::Unable to dispatch standby.yml after 5 attempts"
+          exit 1
       - name: Bootstrap worker
         env:
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
@@ -203,31 +198,55 @@ jobs:
           sudo /opt/vps-venv/bin/python vps/mongo_sync.py once             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
           sudo /opt/vps-venv/bin/python vps/mongo_sync.py request-cutover             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"             --target-run "$id"
 
-      - name: Wait standby VERIFIED
+      - name: Wait standby takeover-ready
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           id="$(cat /tmp/standby-run)"
           for i in $(seq 1 180); do
-            n="$(gh api "/repos/$REPO/actions/artifacts?name=verified-$GITHUB_RUN_ID-$id&per_page=1" --jq '.artifacts|length' 2>/dev/null || echo 0)"
+            n="$(gh api "/repos/$REPO/actions/artifacts?name=takeover-ready-$GITHUB_RUN_ID-$id&per_page=1" --jq '.artifacts|length' 2>/dev/null || echo 0)"
             [ "$n" -gt 0 ] && exit 0
             sleep 10
           done
           echo "Standby verification timeout; ACTIVE worker remains owner"
           exit 1
 
-      - name: Retire active worker
+      - name: Release leadership for handover
         env:
           MONGO_URI: ${{ secrets.MONGODB_URI || secrets.MONGO_URI }}
         run: |
           set -euo pipefail
+          if [ -f /tmp/heartbeat-loop.pid ]; then
+            kill "$(cat /tmp/heartbeat-loop.pid)" 2>/dev/null || true
+            rm -f /tmp/heartbeat-loop.pid
+          fi
           sudo /opt/vps-venv/bin/python controller/state.py release             --uri "$MONGO_URI" --db "$MONGO_DB"             --runner-id "$GITHUB_RUN_ID" --generation "$GITHUB_RUN_NUMBER"
-          echo "OLD_WORKER_RELEASED=YES"
 
-      - name: Keep worker alive only until GitHub cancellation
+      - name: Wait new worker active
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          while true; do
-            bash worker/health.sh
-            sleep 30
+          set -euo pipefail
+          id="$(cat /tmp/standby-run)"
+          for i in $(seq 1 120); do
+            n="$(gh api "/repos/$REPO/actions/artifacts?name=active-ready-$GITHUB_RUN_ID-$id&per_page=1" --jq '.artifacts|length' 2>/dev/null || echo 0)"
+            [ "$n" -gt 0 ] && exit 0
+            sleep 5
           done
+          echo "::error::New worker did not become active"
+          exit 1
+
+      - name: Cancel old worker after takeover
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "/repos/$REPO/actions/runs/$GITHUB_RUN_ID/cancel" >/dev/null 2>&1 || true
+
+      - name: Emergency diagnostics
+        if: failure()
+        run: |
+          echo "HANDOVER_FAILED=YES"
+          tail -n 100 /tmp/heartbeat.log 2>/dev/null || true
+          tail -n 100 /tmp/mongo-sync.log 2>/dev/null || true
+          exit 1
