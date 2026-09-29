@@ -118,7 +118,30 @@ jobs:
             sleep 30
           done
 
-          gh workflow run standby.yml             --repo "$REPO" --ref main             -f source_run_id="$GITHUB_RUN_ID"
+          # GitHub can leave a workflow disabled even though its YAML file
+          # still exists. Re-enable standby before dispatching it so the
+          # A -> B handover cannot die with HTTP 422.
+          if ! gh workflow enable standby.yml --repo "$REPO"; then
+            echo "WARNING: could not enable standby.yml; retrying via REST API"
+            gh api --method PUT               -H "Accept: application/vnd.github+json"               -H "X-GitHub-Api-Version: 2026-03-10"               "/repos/$REPO/actions/workflows/standby.yml/enable"
+          fi
+
+          # Dispatch the hot standby with retries. A transient GitHub API
+          # failure must not immediately terminate the active VPS worker.
+          dispatched=false
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run standby.yml               --repo "$REPO" --ref main               -f source_run_id="$GITHUB_RUN_ID"; then
+              dispatched=true
+              break
+            fi
+            echo "Standby dispatch attempt $attempt failed; retrying..."
+            sleep $((attempt * 5))
+          done
+
+          if [ "$dispatched" != "true" ]; then
+            echo "::error::Unable to dispatch standby.yml after 5 attempts"
+            exit 1
+          fi
 
       - name: Find standby
         env:
