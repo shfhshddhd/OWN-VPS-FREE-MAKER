@@ -26,11 +26,49 @@ jobs:
       VPS_ROOT: /opt/vps-data
       MONGO_DB: own_vps
       SYNC_INTERVAL: 15
-      ROTATE_AFTER: 285
+      HANDOVER_AFTER_MINUTES: 15
       RELAY_HOST: sareeffucker.dmzgate.com
       RELAY_PORT: 16740
     steps:
       - uses: actions/checkout@v6
+
+      - name: Record A start time
+        run: |
+          set -euo pipefail
+          date +%s > /tmp/worker-start-epoch
+
+      - name: Launch hot standby immediately
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dispatch_epoch=$(date +%s)
+          echo "$dispatch_epoch" > /tmp/standby-dispatch-epoch
+
+          if ! gh workflow enable standby.yml --repo "$REPO"; then
+            echo "WARNING: could not enable standby.yml; retrying via REST API"
+            gh api --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "/repos/$REPO/actions/workflows/standby.yml/enable"
+          fi
+
+          dispatched=false
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run standby.yml \
+              --repo "$REPO" --ref main \
+              -f source_run_id="$GITHUB_RUN_ID"; then
+              dispatched=true
+              break
+            fi
+            echo "Standby dispatch attempt $attempt failed; retrying..."
+            sleep $((attempt * 5))
+          done
+
+          if [ "$dispatched" != "true" ]; then
+            echo "::error::Unable to dispatch standby.yml after 5 attempts"
+            exit 1
+          fi
 
       - name: Bootstrap worker
         env:
@@ -107,52 +145,28 @@ jobs:
           sudo kill -0 "$(cat /tmp/heartbeat-loop.pid)"
           echo "ACTIVE_READY=YES"
 
-      - name: Prewarm hot standby
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Confirm hot standby dispatch
         run: |
           set -euo pipefail
-          target=$(($(date +%s) + ROTATE_AFTER*60))
-          while [ "$(date +%s)" -lt "$target" ]; do
-            bash worker/health.sh
-            sleep 30
-          done
-
-          # GitHub can leave a workflow disabled even though its YAML file
-          # still exists. Re-enable standby before dispatching it so the
-          # A -> B handover cannot die with HTTP 422.
-          if ! gh workflow enable standby.yml --repo "$REPO"; then
-            echo "WARNING: could not enable standby.yml; retrying via REST API"
-            gh api --method PUT               -H "Accept: application/vnd.github+json"               -H "X-GitHub-Api-Version: 2026-03-10"               "/repos/$REPO/actions/workflows/standby.yml/enable"
-          fi
-
-          # Dispatch the hot standby with retries. A transient GitHub API
-          # failure must not immediately terminate the active VPS worker.
-          dispatched=false
-          for attempt in 1 2 3 4 5; do
-            if gh workflow run standby.yml               --repo "$REPO" --ref main               -f source_run_id="$GITHUB_RUN_ID"; then
-              dispatched=true
-              break
-            fi
-            echo "Standby dispatch attempt $attempt failed; retrying..."
-            sleep $((attempt * 5))
-          done
-
-          if [ "$dispatched" != "true" ]; then
-            echo "::error::Unable to dispatch standby.yml after 5 attempts"
-            exit 1
-          fi
+          test -s /tmp/standby-dispatch-epoch
+          echo "HOT_STANDBY_DISPATCHED=YES"
 
       - name: Find standby
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          dispatch_epoch="$(cat /tmp/standby-dispatch-epoch)"
           for i in $(seq 1 120); do
-            id="$(gh run list --workflow standby.yml --repo "$REPO"               --event workflow_dispatch --status in_progress --limit 20               --json databaseId,createdAt               --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"') | .databaseId' | head -n1 || true)"
+            id="$(gh run list --workflow standby.yml --repo "$REPO" \
+              --event workflow_dispatch --status in_progress --limit 20 \
+              --json databaseId,createdAt \
+              --jq '.[] | select(.databaseId != '"$GITHUB_RUN_ID"') | select((.createdAt | fromdateiso8601) >= '"$dispatch_epoch"') | .databaseId' \
+              | head -n1 || true)"
             if [ -n "$id" ]; then echo "$id" >/tmp/standby-run; exit 0; fi
             sleep 5
           done
+          echo "No newly dispatched standby found"
           exit 1
 
       - name: Wait standby READY
@@ -168,6 +182,17 @@ jobs:
           done
           echo "Standby READY timeout"
           exit 1
+
+      - name: Hold cutover until 15 minutes from A start
+        run: |
+          set -euo pipefail
+          start="$(cat /tmp/worker-start-epoch)"
+          target=$((start + HANDOVER_AFTER_MINUTES*60))
+          while [ "$(date +%s)" -lt "$target" ]; do
+            bash worker/health.sh
+            sleep 10
+          done
+          echo "HANDOVER_TARGET_REACHED=YES"
 
       - name: Final checkpoint and request cutover
         env:
